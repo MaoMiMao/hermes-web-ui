@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ${WEBUI_IMAGE:-hermes-web-ui-local:latest}
+    image: ${WEBUI_IMAGE:-hermes-web-ui-local:20260601}
     container_name: ${WEBUI_CONTAINER_NAME:-hermes-webui}
     ports:
       - "${PORT:-6060}:${PORT:-6060}"
@@ -20,6 +20,29 @@ services:
       - HERMES_WEB_UI_XAI_CALLBACK_BIND_HOST=0.0.0.0
       - PATH=/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       - HERMES_ALLOW_ROOT_GATEWAY=1
+      - HERMES_DISABLE_LAZY_INSTALLS=1
+      - HERMES_SKIP_NODE_BOOTSTRAP=1
+      - UV_OFFLINE=1
+      - PIP_NO_INDEX=1
+      - PIP_DISABLE_PIP_VERSION_CHECK=1
+      - npm_config_offline=true
+      - npm_config_audit=false
+      - npm_config_fund=false
+      - npm_config_update_notifier=false
+      - HF_HUB_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=1
+      - HF_DATASETS_OFFLINE=1
+      - HF_HUB_DISABLE_TELEMETRY=1
+      - WANDB_DISABLED=true
+      - WANDB_MODE=offline 
+      - DO_NOT_TRACK=1
+      - AWS_EC2_METADATA_DISABLED=true
+      - NO_PROXY=localhost,127.0.0.1,::1,host.docker.internal,hermes-webui
+      - HERMES_API_TIMEOUT=60
+      - HERMES_API_CALL_STALE_TIMEOUT=60
+      - HERMES_STREAM_READ_TIMEOUT=30
+      - HERMES_STREAM_STALE_TIMEOUT=60
+      - TERMINAL_TIMEOUT=60
     restart: unless-stopped
     stdin_open: true
     tty: true
