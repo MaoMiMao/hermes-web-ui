@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
-import { NSpin } from 'naive-ui'
+import { NInput, NSpin } from 'naive-ui'
+import { useI18n } from 'vue-i18n'
 import { request } from '@/api/client'
 
 interface FolderEntry {
@@ -32,6 +33,7 @@ const emit = defineEmits<{
   'update:modelValue': [value: string | null]
 }>()
 
+const { t } = useI18n()
 const loading = ref(false)
 const basePath = ref('')
 const folders = ref<FolderEntry[]>([])
@@ -39,8 +41,15 @@ const expandedPaths = ref<Set<string>>(new Set())
 const childrenCache = ref<Map<string, FolderEntry[]>>(new Map())
 const loadingPaths = ref<Set<string>>(new Set())
 const selectedPath = ref(props.modelValue || '')
+const loadFailed = ref(false)
 
 watch(() => props.modelValue, (v) => { selectedPath.value = v || '' })
+
+function updateSelectedPath(value: string | null) {
+  const next = String(value || '').trim()
+  selectedPath.value = next
+  emit('update:modelValue', next || null)
+}
 
 async function loadFolders(subPath = ''): Promise<FolderListResponse | null> {
   try {
@@ -57,6 +66,9 @@ onMounted(async () => {
   if (res) {
     basePath.value = res.base
     folders.value = res.folders
+    loadFailed.value = false
+  } else {
+    loadFailed.value = true
   }
   loading.value = false
 })
@@ -83,14 +95,11 @@ async function toggleExpand(folder: FolderEntry) {
 }
 
 function selectFolder(folder: FolderEntry) {
-  const fullPath = `${basePath.value}/${folder.path}`
-  selectedPath.value = fullPath
-  emit('update:modelValue', fullPath)
+  updateSelectedPath(folder.fullPath)
 }
 
 function selectBase() {
-  selectedPath.value = basePath.value
-  emit('update:modelValue', basePath.value)
+  updateSelectedPath(basePath.value)
 }
 
 /** Build a flat list by DFS traversal of expanded nodes */
@@ -122,12 +131,21 @@ const flatNodes = computed<FlatNode[]>(() => {
 
 <template>
   <div class="folder-picker">
+    <NInput
+      :value="selectedPath"
+      :placeholder="t('chat.workspacePlaceholder')"
+      clearable
+      size="small"
+      class="folder-path-input"
+      @update:value="updateSelectedPath"
+    />
     <div v-if="loading" class="folder-picker-loading">
       <NSpin size="small" />
     </div>
     <div v-else class="folder-tree">
       <!-- Base path as root -->
       <div
+        v-if="basePath"
         class="folder-item root"
         :class="{ selected: selectedPath === basePath }"
         @click="selectBase"
@@ -141,15 +159,16 @@ const flatNodes = computed<FlatNode[]>(() => {
         v-for="node in flatNodes"
         :key="node.folder.path"
         class="folder-item"
-        :class="{ selected: selectedPath === `${basePath}/${node.folder.path}` }"
+        :class="{ selected: selectedPath === node.folder.fullPath }"
         :style="{ paddingLeft: `${12 + node.depth * 16}px` }"
+        @click="selectFolder(node.folder)"
       >
         <span class="folder-expand" @click.stop="toggleExpand(node.folder)">
           <template v-if="node.isLoading">⏳</template>
           <template v-else>{{ node.isExpanded ? '▼' : '▶' }}</template>
         </span>
-        <span class="folder-icon" @click="selectFolder(node.folder)">📁</span>
-        <span class="folder-name" @click="selectFolder(node.folder)">{{ node.folder.name }}</span>
+        <span class="folder-icon">📁</span>
+        <span class="folder-name">{{ node.folder.name }}</span>
       </div>
 
       <!-- Empty children indicator for expanded folders with no children -->
@@ -159,18 +178,18 @@ const flatNodes = computed<FlatNode[]>(() => {
           class="folder-item empty"
           :style="{ paddingLeft: `${28 + node.depth * 16}px` }"
         >
-          <span class="folder-empty-text">（空）</span>
+          <span class="folder-empty-text">{{ t('chat.folderPickerEmpty') }}</span>
         </div>
       </template>
 
-      <div v-if="folders.length === 0 && !loading" class="folder-empty">
-        暂无工作区文件夹
+      <div v-if="(folders.length === 0 || loadFailed) && !loading" class="folder-empty">
+        {{ t('chat.folderPickerNoFolders') }}
       </div>
     </div>
 
     <!-- Selected path display -->
     <div v-if="selectedPath" class="folder-selected">
-      <span class="folder-selected-label">已选择：</span>
+      <span class="folder-selected-label">{{ t('chat.folderPickerSelected') }}</span>
       <span class="folder-selected-path">{{ selectedPath }}</span>
     </div>
   </div>
@@ -179,11 +198,26 @@ const flatNodes = computed<FlatNode[]>(() => {
 <style scoped lang="scss">
 .folder-picker {
   max-height: 360px;
-  overflow-y: auto;
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 6px;
   padding: 8px;
   background: rgba(0, 0, 0, 0.2);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-height: 0;
+}
+
+.folder-path-input {
+  margin-bottom: 8px;
+  flex-shrink: 0;
+}
+
+.folder-tree {
+  max-height: 260px;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .folder-picker-loading {
@@ -265,6 +299,8 @@ const flatNodes = computed<FlatNode[]>(() => {
   display: flex;
   gap: 4px;
   align-items: center;
+  min-width: 0;
+  flex-shrink: 0;
 }
 
 .folder-selected-label {
@@ -277,5 +313,6 @@ const flatNodes = computed<FlatNode[]>(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
 }
 </style>

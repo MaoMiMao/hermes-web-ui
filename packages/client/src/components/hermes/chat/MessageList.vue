@@ -6,6 +6,11 @@ type SessionScrollSnapshot = {
   wasNearBottom: boolean;
 }
 
+type BottomScrollOptions = number | {
+  frames?: number;
+  keepAliveMs?: number;
+}
+
 const sessionScrollPositions = new Map<string, SessionScrollSnapshot>();
 </script>
 
@@ -26,6 +31,7 @@ const { isDark } = useTheme();
 const { toolTraceVisible } = useToolTraceVisibility();
 const listRef = ref<InstanceType<typeof VirtualMessageList> | null>(null);
 const pendingInitialScrollSessionId = ref<string | null>(null);
+const initialBottomScrollOptions = { frames: 8, keepAliveMs: 1200 };
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M'
@@ -59,6 +65,30 @@ const currentToolCalls = computed(() => {
 const visibleToolCalls = computed(() =>
   currentToolCalls.value.filter((tool) => !!tool.toolName),
 );
+
+const emptyState = computed(() => {
+  const session = chatStore.activeSession;
+  const codingAgentId = session?.codingAgentId || (session?.agent === "codex" ? "codex" : session?.agent === "claude" ? "claude-code" : undefined);
+  if (codingAgentId === "codex") {
+    return {
+      logo: "/coding-agents/codex-openai.png",
+      alt: "Codex",
+      text: t("chat.emptyStateAgent", { agent: "Codex" }),
+    };
+  }
+  if (codingAgentId === "claude-code") {
+    return {
+      logo: "/coding-agents/claude-code.svg",
+      alt: "Claude Code",
+      text: t("chat.emptyStateAgent", { agent: "Claude Code" }),
+    };
+  }
+  return {
+    logo: "/logo.png",
+    alt: "Hermes",
+    text: t("chat.emptyState"),
+  };
+});
 
 const displayMessages = computed(() => {
   const currentToolIds = new Set(currentToolCalls.value.map((tool) => tool.id));
@@ -96,12 +126,12 @@ function queuedPreview(content: string): string {
   return normalized.length > 48 ? `${normalized.slice(0, 48)}...` : normalized;
 }
 
-function isNearBottom(threshold = 200): boolean {
-  return listRef.value?.isNearBottom(threshold) ?? true;
+function shouldAutoFollowBottom(threshold = 100): boolean {
+  return listRef.value?.shouldAutoFollowBottom(threshold) ?? true;
 }
 
-function scrollToBottom() {
-  listRef.value?.scrollToBottom();
+function scrollToBottom(options?: BottomScrollOptions) {
+  listRef.value?.scrollToBottom(options);
 }
 
 function scrollToMessage(messageId: string) {
@@ -130,15 +160,17 @@ function applyInitialSessionScroll(sessionId: string) {
   if (snapshot) {
     pendingInitialScrollSessionId.value = null;
     if (snapshot.wasNearBottom) {
-      scrollToBottom();
+      scrollToBottom(initialBottomScrollOptions);
     } else {
       listRef.value?.restoreViewportPosition(snapshot);
     }
     return;
   }
 
-  scrollToBottom();
-  if (chatStore.messages.length > 0) pendingInitialScrollSessionId.value = null;
+  scrollToBottom(initialBottomScrollOptions);
+  if (chatStore.messages.length > 0 && !chatStore.isLoadingMessages) {
+    pendingInitialScrollSessionId.value = null;
+  }
 }
 
 async function handleTopReach() {
@@ -173,6 +205,24 @@ watch(
 );
 
 watch(
+  () => chatStore.isLoadingMessages,
+  async (isLoading, wasLoading) => {
+    if (isLoading || !wasLoading) return;
+    const id = chatStore.activeSessionId;
+    if (!id || pendingInitialScrollSessionId.value !== id) return;
+    if (chatStore.focusMessageId) {
+      pendingInitialScrollSessionId.value = null;
+      return;
+    }
+    await nextTick();
+    if (chatStore.activeSessionId !== id) return;
+    scrollToBottom(initialBottomScrollOptions);
+    pendingInitialScrollSessionId.value = null;
+  },
+  { flush: "post" },
+);
+
+watch(
   () => chatStore.focusMessageId,
   (messageId) => {
     if (!messageId) return;
@@ -184,7 +234,7 @@ watch(
 watch(
   () => chatStore.isRunActive,
   (v) => {
-    if (v) scrollToBottom();
+    if (v) scrollToBottom({ frames: 3, keepAliveMs: 400 });
   },
 );
 
@@ -197,8 +247,8 @@ watch(
       scrollToMessage(chatStore.focusMessageId);
       return;
     }
-    if (!isNearBottom()) return;
-    scrollToBottom();
+    if (!shouldAutoFollowBottom()) return;
+    scrollToBottom({ frames: 1, keepAliveMs: 0 });
   },
 );
 watch(currentToolCalls, () => {
@@ -207,8 +257,8 @@ watch(currentToolCalls, () => {
     scrollToMessage(chatStore.focusMessageId);
     return;
   }
-  if (!isNearBottom()) return;
-  scrollToBottom();
+  if (!shouldAutoFollowBottom()) return;
+  scrollToBottom({ frames: 1, keepAliveMs: 0 });
 });
 
 onBeforeUnmount(() => {
@@ -231,8 +281,8 @@ defineExpose({
   >
     <template #empty>
       <div class="empty-state">
-        <img src="/logo.png" alt="Hermes" class="empty-logo" />
-        <p>{{ t("chat.emptyState") }}</p>
+        <img :src="emptyState.logo" :alt="emptyState.alt" class="empty-logo" />
+        <p>{{ emptyState.text }}</p>
       </div>
     </template>
     <template #before>
@@ -288,7 +338,9 @@ defineExpose({
             <span class="tool-call-name">
               {{
                 chatStore.abortState.aborting
-                  ? 'Pausing... waiting for the run to stop and sync'
+                  ? chatStore.abortState.timedOut
+                    ? (chatStore.abortState.message || 'Still stopping... new messages will be queued')
+                    : 'Pausing... waiting for the run to stop and sync'
                   : chatStore.abortState.synced
                     ? 'Paused and synced'
                     : 'Paused'

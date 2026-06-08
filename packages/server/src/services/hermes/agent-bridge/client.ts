@@ -91,6 +91,11 @@ export interface AgentBridgeRunResult extends AgentBridgeResponse {
   error?: string | null
 }
 
+export interface AgentBridgeSessionTitle extends AgentBridgeResponse {
+  session_id: string
+  title: string
+}
+
 export interface AgentBridgeContextEstimate extends AgentBridgeResponse {
   session_id: string
   token_count?: number | null
@@ -463,6 +468,14 @@ export class AgentBridgeClient {
     }, options)
   }
 
+  getSessionTitle(sessionId: string, profile?: string, options: AgentBridgeRequestOptions = {}): Promise<AgentBridgeSessionTitle> {
+    return this.request<AgentBridgeSessionTitle>({
+      action: 'get_session_title',
+      session_id: sessionId,
+      ...(profile ? { profile } : {}),
+    }, options)
+  }
+
   async *streamOutput(
     runId: string,
     options: AgentBridgeRequestOptions & { intervalMs?: number } = {},
@@ -568,6 +581,14 @@ export class AgentBridgeClient {
       session_id: sessionId,
       ...(profile ? { profile } : {}),
     })
+  }
+
+  statusIfLoaded(sessionId: string, profile?: string, options: AgentBridgeRequestOptions = {}): Promise<AgentBridgeResponse> {
+    return this.request({
+      action: 'status_if_loaded',
+      session_id: sessionId,
+      ...(profile ? { profile } : {}),
+    }, options)
   }
 
   destroy(sessionId: string, profile?: string, workerKey?: string): Promise<AgentBridgeResponse> {

@@ -9,6 +9,14 @@ import { NButton, NTooltip, NSwitch, NModal, NInputNumber, useMessage } from 'na
 import { computed, ref, nextTick, onMounted, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useToolTraceVisibility } from '@/composables/useToolTraceVisibility'
+import VoiceDialogueControls from './VoiceDialogueControls.vue'
+import { useMicRecorder } from '@/composables/useMicRecorder'
+import { useGlobalSpeech } from '@/composables/useSpeech'
+import { useVoiceDialogue } from '@/composables/useVoiceDialogue'
+import { transcribeSpeech } from '@/api/hermes/stt'
+import type { StoredSttProvider } from '@/api/hermes/stt-settings'
+import { useSttSettings } from '@/composables/useSttSettings'
+import { useBrowserSpeechRecognition } from '@/composables/useBrowserSpeechRecognition'
 
 const chatStore = useChatStore()
 const appStore = useAppStore()
@@ -26,6 +34,112 @@ const attachments = ref<Attachment[]>([])
 const isDragging = ref(false)
 const dragCounter = ref(0)
 const isComposing = ref(false)
+const speech = useGlobalSpeech()
+const micRecorder = useMicRecorder({
+  messages: {
+    unsupported: t('chat.voiceInput.microphoneUnsupported'),
+    recordingFailed: t('chat.voiceInput.microphoneRecordingFailed'),
+  },
+})
+const sttSettings = useSttSettings()
+const browserRecognition = useBrowserSpeechRecognition({
+  messages: {
+    unsupported: t('chat.voiceInput.browserSpeechUnsupported'),
+    failed: t('chat.voiceInput.browserSpeechFailed'),
+    failedWithReason: (reason) => t('chat.voiceInput.browserSpeechFailedWithReason', { error: reason }),
+  },
+})
+const activeVoiceCaptureMode = ref<'browser' | 'backend' | null>(null)
+
+function normalizeVoiceTranscript(text: string) {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
+function backendTranscribeOptions(): {
+  provider: StoredSttProvider
+  language?: string
+  prompt?: string
+} {
+  if (sttSettings.provider.value === 'custom') {
+    return {
+      provider: 'custom',
+      language: sttSettings.customLanguage.value.trim() || undefined,
+      prompt: sttSettings.customPrompt.value.trim() || undefined,
+    }
+  }
+
+  return {
+    provider: 'openai',
+    language: sttSettings.openaiLanguage.value.trim() || undefined,
+    prompt: sttSettings.openaiPrompt.value.trim() || undefined,
+  }
+}
+
+function browserCaptureLanguage() {
+  return sttSettings.openaiLanguage.value.trim() || sttSettings.customLanguage.value.trim() || ''
+}
+
+function insertVoiceTranscriptIntoInput(text: string) {
+  const normalizedTranscript = normalizeVoiceTranscript(text)
+  if (!normalizedTranscript) return
+
+  const el = textareaRef.value
+  const currentValue = inputText.value
+  const selectionStart = el?.selectionStart ?? currentValue.length
+  const selectionEnd = el?.selectionEnd ?? selectionStart
+  const before = currentValue.slice(0, selectionStart)
+  const after = currentValue.slice(selectionEnd)
+  const prefix = before && !/\s$/.test(before) ? ' ' : ''
+  const suffix = after && !/^\s/.test(after) ? ' ' : ''
+  const nextValue = `${before}${prefix}${normalizedTranscript}${suffix}${after}`
+  const nextCursorPosition = before.length + prefix.length + normalizedTranscript.length
+
+  inputText.value = nextValue
+  slashActive.value = false
+
+  nextTick(() => {
+    const textarea = textareaRef.value
+    if (!textarea) return
+
+    textarea.focus()
+    textarea.setSelectionRange(nextCursorPosition, nextCursorPosition)
+
+    if (textareaHeight.value === null) {
+      textarea.style.height = 'auto'
+      textarea.style.height = `${Math.min(textarea.scrollHeight, 100)}px`
+    }
+  })
+}
+
+const voiceDialogue = useVoiceDialogue({
+  transcribe: async (audio) => {
+    const { provider, language, prompt } = backendTranscribeOptions()
+    return transcribeSpeech({ audio, provider, language, prompt })
+  },
+  sendMessage: async (text) => {
+    insertVoiceTranscriptIntoInput(text)
+  },
+  stopOutputAudio: () => speech.stop(true),
+})
+const voiceDialogueTranscript = computed(() => {
+  if (activeVoiceCaptureMode.value !== 'browser' || voiceDialogue.status.value !== 'capturing') {
+    return voiceDialogue.transcript.value
+  }
+
+  return normalizeVoiceTranscript([
+    browserRecognition.transcript.value,
+    browserRecognition.partialTranscript.value,
+  ].filter(Boolean).join(' '))
+})
+const shouldShowBrowserRecognitionError = computed(() =>
+  sttSettings.provider.value === 'browser' || activeVoiceCaptureMode.value === 'browser',
+)
+const voiceDialogueError = computed(() =>
+  voiceDialogue.error.value?.message
+  ?? (shouldShowBrowserRecognitionError.value ? browserRecognition.error.value?.message : null)
+  ?? micRecorder.state.value.error?.message
+  ?? null,
+)
 
 const bridgeCommands = computed(() => [
   { name: 'usage', args: '', description: t('chat.slashCommands.usage') },
@@ -206,8 +320,10 @@ let contextLengthRequest: Promise<void> | null = null
 const showContextEditModal = ref(false)
 const editingContextLimit = ref(256000)
 const isSavingContextLimit = ref(false)
+const isCodingAgentSession = computed(() => chatStore.activeSession?.source === 'coding_agent')
 
 async function handleEditContextLimit() {
+  if (isCodingAgentSession.value) return
   editingContextLimit.value = contextLength.value
   showContextEditModal.value = true
 }
@@ -255,6 +371,7 @@ function currentContextLengthKey() {
 }
 
 async function loadContextLength() {
+  if (isCodingAgentSession.value) return
   const key = currentContextLengthKey()
   if (key === contextLengthLoadedKey) return
   if (key === contextLengthRequestKey && contextLengthRequest) return contextLengthRequest
@@ -291,18 +408,21 @@ watch(
     chatStore.activeSession?.profile,
     chatStore.activeSession?.provider,
     chatStore.activeSession?.model,
+    chatStore.activeSession?.source,
   ],
   loadContextLength,
   { flush: 'post' },
 )
 
 const totalTokens = computed(() => {
+  if (isCodingAgentSession.value) return 0
   const context = chatStore.activeSession?.contextTokens
   if (typeof context === 'number' && Number.isFinite(context) && context > 0) return context
   const input = chatStore.activeSession?.inputTokens ?? 0
   const output = chatStore.activeSession?.outputTokens ?? 0
   return input + output
 })
+const showContextUsage = computed(() => totalTokens.value > 0)
 
 const remainingTokens = computed(() => Math.max(0, contextLength.value - totalTokens.value))
 
@@ -406,6 +526,93 @@ function handleSend() {
   if (textareaRef.value) {
     textareaRef.value.style.height = 'auto'
   }
+}
+
+async function startVoiceCapture() {
+  browserRecognition.clearError()
+  const { captureId } = await voiceDialogue.beginCapture()
+  const useBrowserProvider = sttSettings.provider.value === 'browser'
+
+  activeVoiceCaptureMode.value = useBrowserProvider ? 'browser' : 'backend'
+
+  try {
+    if (useBrowserProvider) {
+      await browserRecognition.start({ language: browserCaptureLanguage() })
+      return
+    }
+
+    await micRecorder.start()
+  } catch {
+    activeVoiceCaptureMode.value = null
+    voiceDialogue.cancelCapture(captureId)
+  }
+}
+
+async function stopVoiceCapture() {
+  const captureId = voiceDialogue.activeCaptureId.value
+  if (!captureId) return
+
+  if (activeVoiceCaptureMode.value === 'browser') {
+    let transcript = ''
+
+    try {
+      transcript = await browserRecognition.stop()
+    } catch {
+      activeVoiceCaptureMode.value = null
+      voiceDialogue.cancelCapture(captureId)
+      return
+    }
+
+    activeVoiceCaptureMode.value = null
+
+    try {
+      await voiceDialogue.commitTranscript(captureId, transcript)
+    } catch {
+      // Voice dialogue state already tracks send errors.
+    }
+    return
+  }
+
+  if (micRecorder.state.value.status === 'requesting') {
+    micRecorder.cancel()
+    activeVoiceCaptureMode.value = null
+    voiceDialogue.cancelCapture(captureId)
+    return
+  }
+
+  let audio: Blob
+
+  try {
+    audio = await micRecorder.stop()
+  } catch {
+    activeVoiceCaptureMode.value = null
+    voiceDialogue.cancelCapture(captureId)
+    return
+  }
+
+  activeVoiceCaptureMode.value = null
+
+  if (audio.size <= 0) {
+    voiceDialogue.cancelCapture(captureId)
+    return
+  }
+
+  try {
+    await voiceDialogue.transcribeAndSend(captureId, audio)
+  } catch {
+    // Voice dialogue state already tracks transcription/send errors.
+  }
+}
+
+function cancelVoiceCapture() {
+  if (activeVoiceCaptureMode.value === 'browser') {
+    browserRecognition.cancel()
+  } else {
+    micRecorder.cancel()
+  }
+
+  activeVoiceCaptureMode.value = null
+  voiceDialogue.cancelCapture()
 }
 
 function handleCompositionStart() {
@@ -555,7 +762,7 @@ function isImage(type: string): boolean {
         {{ toolTraceVisible ? t('chat.hideToolCalls') : t('chat.showToolCalls') }}
       </NTooltip>
 
-      <span v-if="totalTokens > 0" class="context-info" :class="{ 'context-warning': usagePercent > 80 }">
+      <span v-if="showContextUsage" class="context-info" :class="{ 'context-warning': usagePercent > 80 }">
         {{ formatTokens(totalTokens) }} /
         <NTooltip trigger="hover">
           <template #trigger>
@@ -567,7 +774,7 @@ function isImage(type: string): boolean {
         </NTooltip>
         · {{ t('chat.contextRemaining') }} {{ formatTokens(remainingTokens) }}
       </span>
-      <div v-if="totalTokens > 0" class="context-bar">
+      <div v-if="showContextUsage" class="context-bar">
         <div
           class="context-bar-fill"
           :class="{
@@ -653,6 +860,15 @@ function isImage(type: string): boolean {
         </div>
       </Transition>
       <div class="input-actions">
+        <VoiceDialogueControls
+          :status="voiceDialogue.status.value"
+          :transcript="voiceDialogueTranscript"
+          :error="voiceDialogueError"
+          :events="voiceDialogue.events.value"
+          :on-start="startVoiceCapture"
+          :on-stop="stopVoiceCapture"
+          :on-cancel="cancelVoiceCapture"
+        />
         <NButton
           v-if="chatStore.isStreaming"
           size="small"

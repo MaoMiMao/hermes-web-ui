@@ -14,8 +14,11 @@ import { getSystemPrompt } from '../../../lib/llm-prompt'
 import { getSession } from '../../../db/hermes/session-store'
 import { getActiveProfileName, getProfileDir, listProfileNamesFromDisk } from '../hermes-profile'
 import { AgentBridgeClient } from '../agent-bridge'
+import { getAgentBridgeManager } from '../agent-bridge/manager'
+import { redactAgentBridgeError } from '../agent-bridge/redact'
 import { handleApiRun, resolveRunSource, loadSessionStateFromDb } from './handle-api-run'
-import { handleBridgeRun } from './handle-bridge-run'
+import { handleBridgeRun, resumeBridgeRun } from './handle-bridge-run'
+import { handleCodingAgentRun } from './handle-coding-agent-run'
 import { handleAbort } from './abort'
 import { getOrCreateSession } from './compression'
 import { handleSessionCommand, isSessionCommand, parseSessionCommand } from './session-command'
@@ -26,11 +29,42 @@ import { userCanAccessProfile } from '../../../db/hermes/users-store'
 
 export type { ContentBlock } from './types'
 
+function currentProfileFromSocket(socket: Socket): string {
+  const socketProfile = typeof socket.handshake.query?.profile === 'string'
+    ? socket.handshake.query.profile.trim()
+    : ''
+  return socketProfile || getActiveProfileName() || 'default'
+}
+
+function redactBridgeReadyError(error: string, endpoint?: string): string {
+  const normalized = error.replace(/^Error:\s*/, '').trim() || 'unknown error'
+  return redactAgentBridgeError(normalized, endpoint, 'configured endpoint') || 'unknown error'
+}
+
+export async function ensureBridgeReadyForChatRun(): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const readiness = await getAgentBridgeManager().ensureReady({ timeoutMs: 1000, connectRetryMs: 0, recover: false })
+    if (readiness.reachable) {
+      return { ok: true }
+    }
+    return {
+      ok: false,
+      error: redactBridgeReadyError(readiness.error || `Agent Bridge is ${readiness.status}`, readiness.endpoint),
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      error: redactBridgeReadyError(err instanceof Error ? err.message : String(err)),
+    }
+  }
+}
+
 export class ChatRunSocket {
   private nsp: ReturnType<Server['of']>
   private bridge = new AgentBridgeClient()
   /** sessionId → session state (messages, working status, events, run tracking) */
   private sessionMap = new Map<string, SessionState>()
+  private bridgeResumePolls = new Set<string>()
 
   constructor(io: Server) {
     this.nsp = io.of('/chat-run')
@@ -108,7 +142,17 @@ export class ChatRunSocket {
       provider?: string
       model_groups?: Array<{ provider: string; models: string[] }>
       queue_id?: string
+      workspace?: string | null
       source?: string
+      coding_agent_id?: 'claude-code' | 'codex'
+      agent_id?: 'claude-code' | 'codex'
+      mode?: 'scoped' | 'global'
+      baseUrl?: string
+      base_url?: string
+      apiKey?: string
+      api_key?: string
+      apiMode?: string
+      api_mode?: string
       profile?: string
     }) => {
       let runProfile: string
@@ -162,7 +206,17 @@ export class ChatRunSocket {
             model_groups: data.model_groups,
             instructions: data.instructions,
             profile: runProfile,
+            workspace: data.workspace,
             source,
+            codingAgentId: data.coding_agent_id,
+            agentId: data.agent_id,
+            mode: data.mode,
+            baseUrl: data.baseUrl,
+            base_url: data.base_url,
+            apiKey: data.apiKey,
+            api_key: data.api_key,
+            apiMode: data.apiMode,
+            api_mode: data.api_mode,
             originSocketId: socket.id,
           })
           this.nsp.to(`session:${data.session_id}`).emit('run.queued', {
@@ -175,7 +229,7 @@ export class ChatRunSocket {
           return
         }
         state.events = []
-        state.isWorking = true
+        state.isWorking = source !== 'coding_agent'
         state.profile = runProfile
         state.source = source
       }
@@ -218,7 +272,7 @@ export class ChatRunSocket {
       if (!data.session_id) return
       const sid = data.session_id
       socket.join(`session:${sid}`)
-      this.resumeSession(socket, sid)
+      await this.resumeSession(socket, sid)
     })
 
     socket.on('abort', (data: { session_id?: string }) => {
@@ -283,9 +337,19 @@ export class ChatRunSocket {
       provider?: string
       model_groups?: Array<{ provider: string; models: string[] }>
       instructions?: string
+      workspace?: string | null
       source?: string
       queue_id?: string
       peerExcludeSocketId?: string
+      coding_agent_id?: 'claude-code' | 'codex'
+      agent_id?: 'claude-code' | 'codex'
+      mode?: 'scoped' | 'global'
+      baseUrl?: string
+      base_url?: string
+      apiKey?: string
+      api_key?: string
+      apiMode?: string
+      api_mode?: string
     },
     profile: string,
     skipUserMessage = false,
@@ -294,13 +358,53 @@ export class ChatRunSocket {
     if (data.session_id && source === 'cli' && isSessionCommand(data.input)) return
 
     if (source === 'cli') {
+      const bridgeReady = await ensureBridgeReadyForChatRun()
+      if (!bridgeReady.ok) {
+        let shouldDequeueNext = false
+        let queueRemaining = 0
+        if (data.session_id) {
+          const state = this.sessionMap.get(data.session_id)
+          queueRemaining = state?.queue?.length ?? 0
+          const canReleaseCurrentRun = state && !state.runId && !state.abortController && !state.activeRunMarker
+          if (canReleaseCurrentRun) {
+            if (queueRemaining > 0) {
+              const nextQueuedRun = state.queue[0]
+              state.isWorking = true
+              state.profile = nextQueuedRun?.profile || profile
+              state.source = nextQueuedRun?.source
+              shouldDequeueNext = true
+            } else {
+              state.isWorking = false
+              state.profile = undefined
+            }
+          }
+        }
+        const payload: {
+          event: 'run.failed'
+          session_id?: string
+          error: string
+          queue_remaining?: number
+        } = {
+          event: 'run.failed',
+          session_id: data.session_id,
+          error: `Agent Bridge is not reachable: ${bridgeReady.error}`,
+        }
+        if (queueRemaining > 0) payload.queue_remaining = queueRemaining
+        socket.emit('run.failed', payload)
+        if (data.session_id && shouldDequeueNext) {
+          this.dequeueNextQueuedRun(socket, data.session_id, profile)
+        }
+        return
+      }
+
       let fullInstructions = data.instructions
         ? `${getSystemPrompt()}\n${data.instructions}`
         : getSystemPrompt()
       if (data.session_id) {
         const sessionRow = getSession(data.session_id)
-        if (sessionRow?.workspace) {
-          const workspaceCtx = `[Current working directory: ${sessionRow.workspace}]`
+        const workspace = sessionRow?.workspace || String(data.workspace || '').trim()
+        if (workspace) {
+          const workspaceCtx = `[Current working directory: ${workspace}]`
           fullInstructions = `\n${workspaceCtx}\n${fullInstructions}`
         }
       }
@@ -311,6 +415,17 @@ export class ChatRunSocket {
         skipUserMessage,
         loadSessionStateFromDb,
         this.dequeueNextQueuedRun.bind(this),
+      )
+      return
+    }
+
+    if (source === 'coding_agent') {
+      await handleCodingAgentRun(
+        this.nsp,
+        socket,
+        data,
+        profile,
+        this.sessionMap,
       )
       return
     }
@@ -331,6 +446,10 @@ export class ChatRunSocket {
       state = await loadSessionStateFromDb(sid, this.sessionMap)
       this.sessionMap.set(sid, state)
     }
+    await this.reattachBridgeRun(socket, sid, state)
+    const resumeEvents = state.isWorking
+      ? state.events
+      : (state.events || []).filter(evt => evt?.event === 'run.reattach_failed')
     socket.emit('resumed', {
       session_id: sid,
       messages: state.messages,
@@ -340,7 +459,7 @@ export class ChatRunSocket {
       hasMoreBefore: state.hasMoreBefore,
       isWorking: state.isWorking,
       isAborting: state.isAborting || false,
-      events: state.isWorking ? state.events : [],
+      events: resumeEvents,
       inputTokens: state.inputTokens,
       outputTokens: state.outputTokens,
       contextTokens: state.contextTokens,
@@ -352,6 +471,76 @@ export class ChatRunSocket {
       socket.id, sid, state.isWorking, state.messages.length)
   }
 
+  private async reattachBridgeRun(socket: Socket, sid: string, state: SessionState) {
+    if (state.runId && state.isWorking) return
+    const session = getSession(sid)
+    const profile = session?.profile || currentProfileFromSocket(socket)
+    let pollKey: string | undefined
+    try {
+      const status = await this.bridge.statusIfLoaded(sid, profile, { timeoutMs: 1000 }) as Record<string, unknown>
+      const running = status.running === true
+      const runId = typeof status.current_run_id === 'string' ? status.current_run_id : ''
+      if (!running || !runId) return
+      pollKey = `${sid}:${runId}`
+      if (this.bridgeResumePolls.has(pollKey)) return
+      this.bridgeResumePolls.add(pollKey)
+      state.isWorking = true
+      state.isAborting = state.isAborting === true
+      state.runId = runId
+      state.activeRunMarker = undefined
+      state.profile = profile
+      state.source = 'cli'
+      state.events = []
+      const instructions = this.resumeInstructionsForSession(sid)
+      void resumeBridgeRun(
+        this.nsp,
+        socket,
+        {
+          sessionId: sid,
+          runId,
+          profile,
+          instructions,
+          model: session?.model,
+          provider: session?.provider,
+        },
+        this.sessionMap,
+        this.bridge,
+        this.dequeueNextQueuedRun.bind(this),
+      ).finally(() => {
+        if (pollKey) this.bridgeResumePolls.delete(pollKey!)
+      })
+      logger.info('[chat-run-socket] reattached running bridge run %s for session %s', runId, sid)
+    } catch (err) {
+      if (pollKey) this.bridgeResumePolls.delete(pollKey)
+      logger.warn(err, '[chat-run-socket] bridge status lookup failed while resuming session %s', sid)
+      const endpoint = getAgentBridgeManager().getRuntimeState?.().endpoint
+      const error = redactBridgeReadyError(err instanceof Error ? err.message : String(err), endpoint)
+      const payload = {
+        event: 'run.reattach_failed',
+        session_id: sid,
+        error,
+        message: `Unable to confirm Agent Bridge status while resuming: ${error}`,
+        text: `Unable to confirm Agent Bridge status while resuming: ${error}`,
+      }
+      const nextEvents = [...(state.events || [])]
+      const lastEvent = nextEvents[nextEvents.length - 1]
+      if (lastEvent?.event !== 'run.reattach_failed' || lastEvent?.data?.error !== error) {
+        nextEvents.push({ event: 'run.reattach_failed', data: payload })
+        state.events = nextEvents
+      }
+      this.emitToSession(socket, sid, 'run.reattach_failed', payload)
+    }
+  }
+
+  private resumeInstructionsForSession(sessionId: string): string {
+    let fullInstructions = getSystemPrompt()
+    const sessionRow = getSession(sessionId)
+    if (sessionRow?.workspace) {
+      fullInstructions = `\n[Current working directory: ${sessionRow.workspace}]\n${fullInstructions}`
+    }
+    return fullInstructions
+  }
+
   // --- Queue ---
 
   private dequeueNextQueuedRun(socket: Socket, sessionId: string, fallbackProfile = 'default') {
@@ -359,6 +548,9 @@ export class ChatRunSocket {
     if (!state?.queue.length) return false
 
     const next = state.queue.shift()!
+    state.isWorking = true
+    state.profile = next.profile || fallbackProfile
+    state.source = next.source
     logger.info('[chat-run-socket] dequeuing queued run for session %s (remaining: %d)', sessionId, state.queue.length)
     this.nsp.to(`session:${sessionId}`).emit('run.queued', {
       event: 'run.queued',
@@ -383,13 +575,65 @@ export class ChatRunSocket {
       provider: next.provider,
       model_groups: next.model_groups,
       instructions: next.instructions,
+      workspace: next.workspace,
       source: next.source,
       queue_id: next.queue_id,
       peerExcludeSocketId: next.originSocketId,
+      coding_agent_id: next.codingAgentId,
+      agent_id: next.agentId,
+      mode: next.mode,
+      baseUrl: next.baseUrl,
+      base_url: next.base_url,
+      apiKey: next.apiKey,
+      api_key: next.api_key,
+      apiMode: next.apiMode,
+      api_mode: next.api_mode,
     }, next.profile || fallbackProfile, skipUserMessage)
   }
 
   // --- Helpers ---
+
+  emitExternalEvent(sessionId: string, event: string, payload: any) {
+    const tagged = { ...payload, session_id: sessionId }
+    const state = this.sessionMap.get(sessionId)
+    if (state?.isWorking) {
+      state.events.push({ event, data: tagged })
+      if (state.events.length > 200) state.events.splice(0, state.events.length - 200)
+    }
+    this.nsp.to(`session:${sessionId}`).emit(event, tagged)
+  }
+
+  markExternalRunCompleted(sessionId: string, event: string) {
+    const state = this.sessionMap.get(sessionId)
+    if (!state) return
+    state.isWorking = false
+    state.abortController = undefined
+    state.runId = undefined
+    state.activeRunMarker = undefined
+    state.events = []
+    state.responseRun = undefined
+    state.profile = undefined
+    logger.info('[chat-run-socket] external run completed for session %s (%s)', sessionId, event)
+    if (state.queue.length > 0) {
+      const socket = this.socketForQueuedRun(sessionId, state.queue[0])
+      if (socket) this.dequeueNextQueuedRun(socket, sessionId)
+    }
+  }
+
+  private socketForQueuedRun(sessionId: string, next?: QueuedRun): Socket | null {
+    if (next?.originSocketId) {
+      const origin = this.nsp.sockets.get(next.originSocketId)
+      if (origin) return origin
+    }
+    const room = this.nsp.adapter.rooms.get(`session:${sessionId}`)
+    if (room) {
+      for (const socketId of room) {
+        const socket = this.nsp.sockets.get(socketId)
+        if (socket) return socket
+      }
+    }
+    return this.nsp.sockets.values().next().value || null
+  }
 
   private clearClarifyEventState(sessionId: string, clarifyId: string) {
     const state = this.sessionMap.get(sessionId)

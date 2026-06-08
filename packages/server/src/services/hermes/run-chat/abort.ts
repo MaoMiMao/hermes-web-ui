@@ -5,11 +5,14 @@
 import type { Server, Socket } from 'socket.io'
 import { updateSessionStats } from '../../../db/hermes/session-store'
 import { logger } from '../../logger'
+import { codingAgentRunManager } from '../../agent-runner/coding-agent-run-manager'
 import { flushBridgePendingToDb } from './bridge-message'
 import { flushResponseRunToDb } from './response-stream'
 import { replaceState } from './compression'
 import { calcAndUpdateUsage } from './usage'
 import type { QueuedRun, SessionState } from './types'
+
+const ABORT_BRIDGE_SYNC_TIMEOUT_MESSAGE = 'Hermes Agent is still stopping. New messages will be queued until the current run exits.'
 
 export async function handleAbort(
   nsp: ReturnType<Server['of']>,
@@ -19,8 +22,14 @@ export async function handleAbort(
   bridge: any,
   runQueuedItem: (socket: Socket, sessionId: string, next: QueuedRun, fallbackProfile?: string) => void,
 ) {
-  const state = sessionMap.get(sessionId)
-  if (!state?.isWorking || (!state.runId && !state.abortController)) {
+  let state = sessionMap.get(sessionId)
+  const hasCodingAgentRun = codingAgentRunManager.hasSession(sessionId)
+  if (!state && hasCodingAgentRun) {
+    state = { messages: [], isWorking: true, events: [], queue: [], source: 'coding_agent' }
+    sessionMap.set(sessionId, state)
+  }
+  const isCodingAgentRun = state?.source === 'coding_agent' || hasCodingAgentRun
+  if ((!state?.isWorking && !hasCodingAgentRun) || (state && !isCodingAgentRun && !state.runId && !state.abortController)) {
     logger.info({ sessionId }, '[chat-run-socket][abort] ignored: no active run')
     if (state) {
       state.isWorking = false
@@ -37,8 +46,11 @@ export async function handleAbort(
     return
   }
 
-  const runId = state.runId
-  state.isAborting = true
+  const activeState = state
+  if (!activeState) return
+
+  const runId = activeState.runId
+  activeState.isAborting = true
   replaceState(sessionMap, sessionId, 'abort.started', {
     event: 'abort.started',
     run_id: runId,
@@ -52,26 +64,45 @@ export async function handleAbort(
   logger.info({ sessionId, runId }, '[chat-run-socket][abort] started')
 
   // Flush in-memory assistant text to DB before aborting the stream.
-  if (state.source === 'cli') {
-    flushBridgePendingToDb(state, sessionId)
+  if (activeState.source === 'cli') {
+    flushBridgePendingToDb(activeState, sessionId)
   } else {
-    flushResponseRunToDb(state, sessionId)
+    flushResponseRunToDb(activeState, sessionId)
   }
 
-  if (state.source === 'cli') {
+  if (activeState.source === 'cli') {
+    let interruptResult: any = null
     try {
-      await bridge.interrupt(sessionId, 'Aborted by user', state.profile)
+      interruptResult = await bridge.interrupt(sessionId, 'Aborted by user', activeState.profile)
     } catch (err) {
       logger.warn(err, '[chat-run-socket][abort] failed to interrupt CLI bridge for session %s', sessionId)
     }
     try {
-      await bridge.goalPause?.(sessionId, 'user-interrupted', state.profile)
-      state.queue = state.queue.filter(item => !item.goalContinuation)
+      await bridge.goalPause?.(sessionId, 'user-interrupted', activeState.profile)
+      activeState.queue = activeState.queue.filter(item => !item.goalContinuation)
     } catch (err) {
       logger.debug(err, '[chat-run-socket][abort] goal pause-on-interrupt skipped for session %s', sessionId)
     }
-  } else if (state.abortController) {
-    state.abortController.abort()
+    if (interruptResult?.synced === false) {
+      replaceState(sessionMap, sessionId, 'abort.timeout', {
+        event: 'abort.timeout',
+        run_id: runId,
+        synced: false,
+        message: ABORT_BRIDGE_SYNC_TIMEOUT_MESSAGE,
+      })
+      emitToSession(nsp, socket, sessionId, 'abort.timeout', {
+        event: 'abort.timeout',
+        run_id: runId,
+        synced: false,
+        message: ABORT_BRIDGE_SYNC_TIMEOUT_MESSAGE,
+      })
+      logger.warn({ sessionId, runId }, '[chat-run-socket][abort] CLI bridge interrupt did not sync before timeout')
+      return
+    }
+  } else if (activeState.source === 'coding_agent') {
+    codingAgentRunManager.stop(sessionId, { reportClosed: false })
+  } else if (activeState.abortController) {
+    activeState.abortController.abort()
   }
 
   await markAbortCompleted(nsp, socket, sessionId, runId || 'response_stream', sessionMap, runQueuedItem)

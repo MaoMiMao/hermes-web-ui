@@ -47,6 +47,7 @@ function changedFilesFromGit() {
 
   for (const file of gitLines(['diff', '--name-only'])) files.add(file)
   for (const file of gitLines(['diff', '--name-only', '--cached'])) files.add(file)
+  for (const file of gitLines(['ls-files', '--others', '--exclude-standard'])) files.add(file)
 
   const baseRef = process.env.GITHUB_BASE_REF
   if (baseRef) {
@@ -91,6 +92,12 @@ function isChatSessionChainFile(file) {
     || file.startsWith('packages/server/src/services/hermes/agent-bridge/')
 }
 
+function isChatChainChangeFragment(file) {
+  return file.startsWith('docs/chat-chain-changes/')
+    && file.endsWith('.md')
+    && path.basename(file) !== 'README.md'
+}
+
 for (const file of [
   'AGENTS.md',
   'ARCHITECTURE.md',
@@ -99,6 +106,7 @@ for (const file of [
   'docs/harness/validation.md',
   'docs/harness/worktree-runbook.md',
   'docs/harness/pr-review.md',
+  'docs/chat-chain-changes/README.md',
 ]) {
   requireFile(file)
 }
@@ -112,6 +120,7 @@ for (const dir of [
   'tests/server',
   'tests/e2e',
   '.github/workflows',
+  'docs/chat-chain-changes',
 ]) {
   requireDir(dir)
 }
@@ -189,6 +198,8 @@ for (const phrase of [
   '最后重建时间',
   '维护要求',
   '最近链路变更记录',
+  'docs/chat-chain-changes/',
+  '每个 PR 一个变更片段',
   'packages/server/src/services/hermes/agent-bridge/',
   'packages/server/src/services/hermes/group-chat/',
   'packages/server/src/lib/context-compressor/',
@@ -201,19 +212,40 @@ for (const phrase of [
 
 const changedFiles = changedFilesFromGit()
 const changedChatChainFiles = changedFiles.filter(
-  file => file !== 'docs/cli-chat-sessions.md' && isChatSessionChainFile(file),
+  file => !isChatChainChangeFragment(file)
+    && file !== 'docs/chat-chain-changes/README.md'
+    && file !== 'docs/cli-chat-sessions.md'
+    && isChatSessionChainFile(file),
 )
-if (changedChatChainFiles.length > 0 && !changedFiles.includes('docs/cli-chat-sessions.md')) {
+const changedChatChainFragments = changedFiles.filter(isChatChainChangeFragment)
+if (changedChatChainFiles.length > 0 && changedChatChainFragments.length === 0) {
   fail(
     [
-      'Chat session chain changed without updating docs/cli-chat-sessions.md.',
-      'Update "最近链路变更记录" with date, PR/commit, touched feature, and behavior impact.',
+      'Chat session chain changed without adding a docs/chat-chain-changes/*.md fragment.',
+      'Add one fragment with date, PR/commit, touched feature, and behavior impact.',
       `Changed chain files: ${changedChatChainFiles.join(', ')}`,
     ].join(' '),
   )
 }
+for (const file of changedChatChainFragments) {
+  if (!existsSync(path.join(root, file))) {
+    fail(`Chat chain change fragment was removed instead of added/updated: ${file}`)
+    continue
+  }
+  const fragment = await readText(file)
+  for (const marker of ['date:', 'feature:', 'impact:']) {
+    if (!fragment.includes(marker)) {
+      fail(`Chat chain change fragment ${file} must include frontmatter field: ${marker}`)
+    }
+  }
+  if (!fragment.includes('pr:') && !fragment.includes('commit:')) {
+    fail(`Chat chain change fragment ${file} must include either pr: or commit:`)
+  }
+}
 
 const desktopReleaseWorkflow = await readText('.github/workflows/desktop-release.yml')
+const desktopManualBuildWorkflow = await readText('.github/workflows/desktop-manual-build.yml')
+const desktopMacUpdateManifestWorkflow = await readText('.github/workflows/desktop-mac-update-manifest.yml')
 const desktopRuntimeWorkflow = await readText('.github/workflows/desktop-runtime.yml')
 const electronBuilderConfig = await readText('packages/desktop/electron-builder.yml')
 const desktopPackageJson = await readText('packages/desktop/package.json')
@@ -244,6 +276,49 @@ for (const expectedGlob of ['*.dmg', '*.exe', '*.AppImage']) {
 
 if (!desktopReleaseWorkflow.includes('fail_on_unmatched_files: true')) {
   fail('desktop-release.yml must keep fail_on_unmatched_files: true')
+}
+
+function workflowCaseBody(text, caseLabel) {
+  const start = text.indexOf(`${caseLabel})`)
+  if (start < 0) fail(`desktop-manual-build.yml is missing ${caseLabel} case`)
+  const end = text.indexOf(';;', start)
+  if (end < 0) fail(`desktop-manual-build.yml ${caseLabel} case is missing terminator`)
+  return text.slice(start, end)
+}
+
+for (const macCase of ['darwin-arm64', 'darwin-x64']) {
+  const body = workflowCaseBody(desktopManualBuildWorkflow, macCase)
+  if (body.includes('latest*.yml')) {
+    fail(`desktop-manual-build.yml must not publish single-arch macOS update manifests from ${macCase}`)
+  }
+  for (const glob of ['*.dmg.blockmap', '*.zip.blockmap']) {
+    if (!body.includes(glob)) {
+      fail(`desktop-manual-build.yml ${macCase} must keep uploading ${glob}`)
+    }
+  }
+}
+
+for (const phrase of [
+  'mac-update-manifest:',
+  "if: needs.validate.outputs.target_os == 'darwin' && github.event.inputs.release_tag != ''",
+  'Both macOS architectures are not available yet; leaving latest-mac.yml unchanged.',
+  'gh release upload "$TAG" /tmp/latest-mac.yml',
+]) {
+  if (!desktopManualBuildWorkflow.includes(phrase)) {
+    fail(`desktop-manual-build.yml must include macOS manifest repair behavior: ${phrase}`)
+  }
+}
+
+if (!desktopMacUpdateManifestWorkflow.includes('Repair macOS Update Manifest')) {
+  fail('desktop-mac-update-manifest.yml must provide a manual macOS manifest repair workflow')
+}
+
+if (!desktopMacUpdateManifestWorkflow.includes("gh release download \"$TAG\"") || !desktopMacUpdateManifestWorkflow.includes('/tmp/latest-mac.yml')) {
+  fail('desktop-mac-update-manifest.yml must generate latest-mac.yml from release assets')
+}
+
+if (!desktopMacUpdateManifestWorkflow.includes('gh release upload "$TAG" /tmp/latest-mac.yml')) {
+  fail('desktop-mac-update-manifest.yml must upload the merged latest-mac.yml to the release')
 }
 
 for (const phrase of [
