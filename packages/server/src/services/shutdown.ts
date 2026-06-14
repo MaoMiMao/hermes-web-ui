@@ -5,7 +5,7 @@ import { codingAgentRunManager } from './agent-runner/coding-agent-run-manager'
 import { shutdownManagedGateways } from './hermes/gateway-runner'
 
 const DEFAULT_SHUTDOWN_FORCE_EXIT_MS = 15_000
-const DEFAULT_DESKTOP_SHUTDOWN_FORCE_EXIT_MS = 3_000
+const DEFAULT_DESKTOP_SHUTDOWN_FORCE_EXIT_MS = 15_000
 
 function envPositiveInt(name: string): number | undefined {
   const value = Number(process.env[name])

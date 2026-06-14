@@ -1,3 +1,5 @@
+import { execFile } from 'child_process'
+import { promisify } from 'util'
 import { logger } from '../logger'
 import { getActiveProfileDir } from './hermes-profile'
 import { spawnHermesWithBin } from './hermes-process'
@@ -38,6 +40,7 @@ const profileState = new Map<string, ProfileState>()
 /** Delay before respawning a gateway that exited unexpectedly. */
 const RESPAWN_DELAY_MS = 2000
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 2000
+const execFileAsync = promisify(execFile)
 
 export interface ManagedGatewayShutdownResult {
   signaled: number
@@ -54,6 +57,8 @@ function getOrCreateProfileState(profileDir: string): ProfileState {
   return state
 }
 
+type KillWindowsProcessTree = (pid: number) => Promise<void>
+
 function clearRespawnTimer(state: ProfileState, profileDir: string): void {
   if (!state.respawnTimer) return
   clearTimeout(state.respawnTimer)
@@ -61,7 +66,36 @@ function clearRespawnTimer(state: ProfileState, profileDir: string): void {
   logger.info('[gateway-runner] cancelled pending respawn profileDir=%s', profileDir)
 }
 
-async function stopManagedGateway(entry: SupervisedGateway, timeoutMs: number): Promise<{ forced: boolean; error?: unknown }> {
+async function taskkillWindowsProcessTree(pid: number): Promise<void> {
+  await execFileAsync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+    timeout: 5000,
+    windowsHide: true,
+  })
+}
+
+async function stopManagedGateway(
+  entry: SupervisedGateway,
+  opts: {
+    timeoutMs: number
+    platform: NodeJS.Platform
+    killWindowsProcessTree: KillWindowsProcessTree
+  },
+): Promise<{ forced: boolean; error?: unknown }> {
+  if (opts.platform === 'win32') {
+    try {
+      await opts.killWindowsProcessTree(entry.pid)
+      return { forced: true }
+    } catch (err) {
+      logger.warn(err, '[gateway-runner] taskkill failed for managed gateway pid=%s; falling back to child.kill', entry.pid)
+      try {
+        entry.child.kill('SIGKILL')
+        return { forced: true, error: err }
+      } catch (killErr) {
+        return { forced: true, error: killErr }
+      }
+    }
+  }
+
   return new Promise(resolve => {
     let settled = false
     let forced = false
@@ -84,7 +118,7 @@ async function stopManagedGateway(entry: SupervisedGateway, timeoutMs: number): 
         return
       }
       finish()
-    }, timeoutMs)
+    }, opts.timeoutMs)
 
     entry.child.once('exit', onExit)
 
@@ -98,9 +132,15 @@ async function stopManagedGateway(entry: SupervisedGateway, timeoutMs: number): 
 }
 
 export async function shutdownManagedGateways(
-  opts: { timeoutMs?: number } = {},
+  opts: {
+    timeoutMs?: number
+    platform?: NodeJS.Platform
+    killWindowsProcessTree?: KillWindowsProcessTree
+  } = {},
 ): Promise<ManagedGatewayShutdownResult> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS
+  const platform = opts.platform ?? process.platform
+  const killWindowsProcessTree = opts.killWindowsProcessTree ?? taskkillWindowsProcessTree
   const stops: Promise<{ forced: boolean; error?: unknown }>[] = []
   let signaled = 0
 
@@ -116,7 +156,7 @@ export async function shutdownManagedGateways(
     state.current = null
     signaled += 1
     logger.info('[gateway-runner] stopping managed gateway profileDir=%s pid=%s', profileDir, entry.pid)
-    stops.push(stopManagedGateway(entry, timeoutMs))
+    stops.push(stopManagedGateway(entry, { timeoutMs, platform, killWindowsProcessTree }))
     profileState.delete(profileDir)
   }
 

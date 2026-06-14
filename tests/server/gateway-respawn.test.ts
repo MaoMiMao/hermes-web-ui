@@ -200,4 +200,22 @@ describe('gateway-runner supervision', () => {
     await expect(shutdown).resolves.toEqual({ signaled: 1, forced: 1, errors: 0 })
     expect(fakeChildren[0].killSignals).toEqual(['SIGTERM', 'SIGKILL'])
   })
+
+  it('kills the managed gateway process tree on Windows shutdown', async () => {
+    vi.resetModules()
+    const killWindowsProcessTree = vi.fn().mockResolvedValue(undefined)
+    const { shutdownManagedGateways, startGatewayRunManaged } = await import(
+      '../../packages/server/src/services/hermes/gateway-runner'
+    )
+
+    startGatewayRunManaged('/usr/bin/hermes', { profileDir: '/tmp/shutdown-win' })
+
+    await expect(shutdownManagedGateways({
+      platform: 'win32',
+      killWindowsProcessTree,
+    })).resolves.toEqual({ signaled: 1, forced: 1, errors: 0 })
+
+    expect(killWindowsProcessTree).toHaveBeenCalledWith(10000)
+    expect(fakeChildren[0].killSignals).toEqual([])
+  })
 })

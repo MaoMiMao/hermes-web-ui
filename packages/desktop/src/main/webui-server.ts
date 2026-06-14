@@ -24,6 +24,7 @@ import {
 const DEFAULT_PORT = 8748
 const DEFAULT_READY_TIMEOUT_MS = 120_000
 const DEFAULT_FULL_STARTUP_WAIT_MS = 0
+const DEFAULT_STOP_TIMEOUT_MS = 20_000
 const AGENT_BRIDGE_STARTED_MARKER = '[bootstrap] agent bridge started'
 const AGENT_BRIDGE_FAILED_MARKER = '[bootstrap] agent bridge failed to start'
 const execFileAsync = promisify(execFile)
@@ -461,7 +462,7 @@ export function stopWebUiServer(): Promise<void> {
     const timer = setTimeout(() => {
       killProcessTree(proc)
       resolve()
-    }, 3000)
+    }, envPositiveInt('HERMES_DESKTOP_STOP_TIMEOUT_MS') || DEFAULT_STOP_TIMEOUT_MS)
     proc.once('exit', () => {
       clearTimeout(timer)
       resolve()

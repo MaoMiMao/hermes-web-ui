@@ -61,14 +61,14 @@ describe('shutdown bridge policy', () => {
     expect(shouldStopManagedGatewaysOnShutdown()).toBe(false)
   })
 
-  it('keeps desktop shutdown force-exit timing short by default', () => {
+  it('keeps desktop shutdown force-exit timing long enough for runtime cleanup by default', () => {
     delete process.env.HERMES_WEB_UI_SHUTDOWN_FORCE_EXIT_MS
 
     delete process.env.HERMES_DESKTOP
     expect(getShutdownForceExitMs()).toBe(15_000)
 
     process.env.HERMES_DESKTOP = 'true'
-    expect(getShutdownForceExitMs()).toBe(3_000)
+    expect(getShutdownForceExitMs()).toBe(15_000)
   })
 
   it('allows operators to override shutdown force-exit timing', () => {
