@@ -686,6 +686,131 @@ describe('coding agent run state', () => {
     manager.shutdown()
   })
 
+  it('stores Codex reasoning items in the response run state', () => {
+    initAllHermesTables()
+    const manager = new CodingAgentRunManager()
+    const state: any = { messages: [], isWorking: false, events: [], queue: [] }
+    const emitted: Array<{ event: string; payload: any }> = []
+    ;(manager as any).emitToChat = (_sessionId: string, event: string, payload: any) => {
+      emitted.push({ event, payload })
+    }
+    ;(manager as any).markChatRunCompleted = () => {}
+    const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+    const agentSessionId = `agent-session-codex-reasoning-${suffix}`
+    const chatSessionId = `chat-session-codex-reasoning-${suffix}`
+    manager.start({
+      agentSessionId,
+      agentId: 'codex',
+      profile: 'default',
+      provider: 'test-provider',
+      model: 'gpt-5-codex',
+      sessionId: chatSessionId,
+      command: 'codex',
+      args: ['--model', 'gpt-5-codex'],
+      shellCommand: 'codex --model gpt-5-codex',
+      workspaceDir: process.cwd(),
+      state,
+    })
+    const run = (manager as any).runs.get(agentSessionId)
+    run.printResponseId = 'resp_codex_reasoning'
+    run.printMessageId = 'msg_resp_codex_reasoning'
+    run.printTextStarted = false
+    run.printText = ''
+    run.printCompleted = false
+    run.responseStartEmitted = false
+    run.terminalEventHandled = false
+    run.codexToolBlocks = new Map()
+    run.codexChatText = ''
+    ;(manager as any).handleClaudePrintResponseEvent(run, {
+      type: 'response.created',
+      data: { response: { id: 'resp_codex_reasoning', status: 'in_progress', model: 'gpt-5-codex', output: [] } },
+    })
+
+    ;(manager as any).handleCodexExecLine(run, JSON.stringify({
+      type: 'item.completed',
+      item: { type: 'reasoning', summary: [{ text: 'Need inspect. ' }, { text: 'Then answer.' }] },
+    }))
+    ;(manager as any).handleCodexExecLine(run, JSON.stringify({
+      type: 'response_item',
+      payload: { type: 'reasoning', summary: [{ type: 'summary_text', text: ' From response item.' }] },
+    }))
+    ;(manager as any).handleCodexExecLine(run, JSON.stringify({
+      method: 'item/reasoning/delta',
+      params: { delta: ' Extra.' },
+    }))
+    ;(manager as any).handleCodexExecLine(run, JSON.stringify({
+      method: 'item/agentMessage/delta',
+      params: { delta: 'Done.' },
+    }))
+
+    expect(emitted.filter(event => event.event === 'reasoning.delta').map(event => event.payload.delta)).toEqual([
+      'Need inspect. Then answer.',
+      ' From response item.',
+      ' Extra.',
+    ])
+    expect(state.messages.find((message: any) => message.role === 'assistant')).toMatchObject({
+      content: 'Done.',
+      reasoning: 'Need inspect. Then answer. From response item. Extra.',
+      reasoning_content: 'Need inspect. Then answer. From response item. Extra.',
+    })
+    manager.shutdown()
+  })
+
+  it('does not append unrelated Codex final text without a tool boundary', () => {
+    initAllHermesTables()
+    const manager = new CodingAgentRunManager()
+    const state: any = { messages: [], isWorking: false, events: [], queue: [] }
+    const emitted: Array<{ event: string; payload: any }> = []
+    ;(manager as any).emitToChat = (_sessionId: string, event: string, payload: any) => {
+      emitted.push({ event, payload })
+    }
+    ;(manager as any).markChatRunCompleted = () => {}
+    const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+    const agentSessionId = `agent-session-codex-no-tool-final-${suffix}`
+    const chatSessionId = `chat-session-codex-no-tool-final-${suffix}`
+    manager.start({
+      agentSessionId,
+      agentId: 'codex',
+      profile: 'default',
+      provider: 'test-provider',
+      model: 'gpt-5-codex',
+      sessionId: chatSessionId,
+      command: 'codex',
+      args: ['--model', 'gpt-5-codex'],
+      shellCommand: 'codex --model gpt-5-codex',
+      workspaceDir: process.cwd(),
+      state,
+    })
+    const run = (manager as any).runs.get(agentSessionId)
+    run.printResponseId = 'resp_codex_no_tool_final'
+    run.printMessageId = 'msg_resp_codex_no_tool_final'
+    run.printTextStarted = false
+    run.printText = ''
+    run.printCompleted = false
+    run.responseStartEmitted = false
+    run.terminalEventHandled = false
+    run.codexToolBlocks = new Map()
+    ;(manager as any).handleClaudePrintResponseEvent(run, {
+      type: 'response.created',
+      data: { response: { id: 'resp_codex_no_tool_final', status: 'in_progress', model: 'gpt-5-codex', output: [] } },
+    })
+
+    ;(manager as any).handleCodexExecLine(run, JSON.stringify({
+      type: 'item.completed',
+      item: { type: 'agent_message', text: 'Initial assistant text.' },
+    }))
+    ;(manager as any).handleCodexExecLine(run, JSON.stringify({
+      type: 'item.completed',
+      item: { type: 'agent_message', text: 'Different final text without tools.' },
+    }))
+    ;(manager as any).completeCodexExecTurn(run)
+
+    const textMessages = state.messages.filter((message: any) => message.role === 'assistant' && !message.tool_calls?.length)
+    expect(textMessages.map((message: any) => message.content)).toEqual(['Initial assistant text.'])
+    expect(emitted.filter(event => event.event === 'message.delta').map(event => event.payload.delta)).toEqual(['Initial assistant text.'])
+    manager.shutdown()
+  })
+
   it('keeps repeated short Codex streaming deltas', () => {
     initAllHermesTables()
     const manager = new CodingAgentRunManager()
@@ -782,6 +907,16 @@ describe('coding agent run state', () => {
       data: { response: { id: 'resp_codex_tool_final', status: 'in_progress', model: 'gpt-5-codex', output: [] } },
     })
 
+    const openingText = '我会先查看你的桌面目录。'
+    ;(manager as any).handleCodexExecLine(run, JSON.stringify({
+      type: 'item.completed',
+      item: { type: 'agent_message', text: openingText },
+    }))
+    expect(state.messages).toContainEqual(expect.objectContaining({
+      role: 'assistant',
+      content: openingText,
+    }))
+
     manager.handleResponseEvent(agentSessionId, {
       type: 'response.output_item.added',
       data: {
@@ -862,17 +997,15 @@ describe('coding agent run state', () => {
 
     const finalText = '你的桌面上有以下 3 个目录：ai素材、cache、git。'
     ;(manager as any).handleCodexExecLine(run, JSON.stringify({
-      method: 'item/agentMessage/delta',
-      params: { delta: finalText },
+      type: 'item.completed',
+      item: { type: 'agent_message', text: finalText },
     }))
     run.currentChild = undefined
     ;(manager as any).completeCodexExecTurn(run, run.codexPendingUsage)
 
-    expect(state.messages).toContainEqual(expect.objectContaining({
-      role: 'assistant',
-      content: finalText,
-      finish_reason: 'stop',
-    }))
+    const textMessages = state.messages.filter((message: any) => message.role === 'assistant' && !message.tool_calls?.length)
+    expect(textMessages.map((message: any) => message.content)).toEqual([openingText, finalText])
+    expect(textMessages.at(-1)).toEqual(expect.objectContaining({ finish_reason: 'stop' }))
     const dbMessages = getSessionDetail(chatSessionId)?.messages || []
     expect(dbMessages.filter(message => message.role === 'assistant' && message.tool_calls?.length)).toHaveLength(1)
     expect(dbMessages).toContainEqual(expect.objectContaining({
@@ -885,6 +1018,91 @@ describe('coding agent run state', () => {
       content: finalText,
     }))
     expect(emitted.map(event => event.event)).toContain('run.completed')
+    manager.shutdown()
+  })
+
+  it('truncates large coding-agent tool outputs before emitting and flushing to SQLite', () => {
+    initAllHermesTables()
+    const manager = new CodingAgentRunManager()
+    const state: any = { messages: [], isWorking: false, events: [], queue: [] }
+    const emitted: Array<{ event: string; payload: any }> = []
+    ;(manager as any).emitToChat = (_sessionId: string, event: string, payload: any) => {
+      emitted.push({ event, payload })
+    }
+    ;(manager as any).markChatRunCompleted = () => {}
+    const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+    const agentSessionId = `agent-session-codex-large-tool-${suffix}`
+    const chatSessionId = `chat-session-codex-large-tool-${suffix}`
+    manager.start({
+      agentSessionId,
+      agentId: 'codex',
+      profile: 'default',
+      provider: 'test-provider',
+      model: 'gpt-5-codex',
+      sessionId: chatSessionId,
+      command: 'codex',
+      args: ['--model', 'gpt-5-codex'],
+      shellCommand: 'codex --model gpt-5-codex',
+      workspaceDir: process.cwd(),
+      state,
+    })
+    const run = (manager as any).runs.get(agentSessionId)
+    const largeOutput = `HEAD-${'a'.repeat(80 * 1024)}-TAIL`
+
+    ;(manager as any).handleClaudePrintResponseEvent(run, {
+      type: 'response.created',
+      data: { response: { id: 'resp_large_tool', status: 'in_progress', model: 'gpt-5-codex', output: [] } },
+    })
+    ;(manager as any).handleClaudePrintResponseEvent(run, {
+      type: 'response.output_item.added',
+      data: {
+        item: {
+          type: 'function_call',
+          id: 'call_large',
+          call_id: 'call_large',
+          name: 'read_file',
+          arguments: '{"path":"big.log"}',
+        },
+      },
+    })
+    ;(manager as any).handleClaudePrintResponseEvent(run, {
+      type: 'response.output_item.done',
+      data: {
+        item: {
+          type: 'function_call',
+          id: 'call_large',
+          call_id: 'call_large',
+          name: 'read_file',
+          arguments: '{"path":"big.log"}',
+        },
+      },
+    })
+    ;(manager as any).handleClaudePrintResponseEvent(run, {
+      type: 'response.output_item.done',
+      data: {
+        item: {
+          type: 'function_call_output',
+          id: 'call_large',
+          call_id: 'call_large',
+          output: largeOutput,
+        },
+      },
+    })
+    ;(manager as any).handleClaudePrintResponseEvent(run, {
+      type: 'response.completed',
+      data: { response: { id: 'resp_large_tool', status: 'completed', model: 'gpt-5-codex', output: [] } },
+    })
+
+    const toolMessage = state.messages.find((message: any) => message.role === 'tool')
+    const completedPayload = emitted.find(event => event.event === 'tool.completed')?.payload as any
+    const dbToolMessage = (getSessionDetail(chatSessionId)?.messages || []).find(message => message.role === 'tool')
+    for (const output of [toolMessage?.content, completedPayload?.output, dbToolMessage?.content]) {
+      expect(output).toContain('HEAD-')
+      expect(output).toContain('-TAIL')
+      expect(output).toContain('coding-agent tool output truncated for storage')
+      expect(output.length).toBeLessThan(largeOutput.length)
+      expect(output.length).toBeLessThan(34 * 1024)
+    }
     manager.shutdown()
   })
 

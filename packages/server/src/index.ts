@@ -1,4 +1,5 @@
 import Koa from 'koa'
+import type { Context } from 'koa'
 import cors from '@koa/cors'
 import bodyParser from '@koa/bodyparser'
 import serve from 'koa-static'
@@ -26,8 +27,10 @@ import { refreshConfiguredProviderModelCatalogsInBackground } from './services/h
 import { scanLanDevices, startLanDiscoveryResponder } from './services/lan-discovery'
 import { getLanPeerSocketManager, getLanPeerSocketPath } from './services/lan-peer-socket'
 import { logger } from './services/logger'
+import { createStaticCompressionMiddleware } from './middleware/static-compression'
 import { requireUserJwt, resolveUserProfile } from './middleware/user-auth'
 import { createCorsOriginResolver, securityHeaders } from './security'
+import type { ShutdownHandler } from './services/shutdown'
 
 // Injected by esbuild at build time; fallback to reading package.json in dev mode
 declare const __APP_VERSION__: string
@@ -53,6 +56,7 @@ let server: any = null
 let servers: any[] = []
 let chatRunServer: any = null
 let agentBridgeManager: any = null
+let desktopShutdownHandler: ShutdownHandler | null = null
 
 interface ListenResult {
   primary: any
@@ -90,6 +94,61 @@ function isDesktopRuntime(): boolean {
   return String(process.env.HERMES_DESKTOP || '').trim().toLowerCase() === 'true'
 }
 
+function isLoopbackAddress(address?: string | null): boolean {
+  if (!address) return false
+  return address === '127.0.0.1'
+    || address === '::1'
+    || address === '::ffff:127.0.0.1'
+    || address.startsWith('::ffff:127.')
+}
+
+function bearerToken(ctx: Context): string {
+  const header = ctx.get('authorization')
+  const match = header.match(/^Bearer\s+(.+)$/i)
+  return match?.[1]?.trim() || ''
+}
+
+function registerDesktopShutdownRoute(app: Koa): void {
+  app.use(async (ctx, next) => {
+    if (ctx.method !== 'POST' || ctx.path !== '/api/desktop/shutdown') {
+      await next()
+      return
+    }
+
+    if (!isDesktopRuntime()) {
+      ctx.status = 404
+      ctx.body = { error: 'not_found' }
+      return
+    }
+
+    const remoteAddress = ctx.req.socket.remoteAddress
+    if (!isLoopbackAddress(remoteAddress)) {
+      ctx.status = 403
+      ctx.body = { error: 'forbidden' }
+      return
+    }
+
+    const expectedToken = String(process.env.AUTH_TOKEN || '').trim()
+    if (!expectedToken || bearerToken(ctx) !== expectedToken) {
+      ctx.status = 401
+      ctx.body = { error: 'unauthorized' }
+      return
+    }
+
+    if (!desktopShutdownHandler) {
+      ctx.status = 503
+      ctx.body = { error: 'shutdown_not_ready' }
+      return
+    }
+
+    ctx.status = 202
+    ctx.body = { ok: true }
+    setTimeout(() => {
+      void desktopShutdownHandler?.('desktop-api')
+    }, 50).unref?.()
+  })
+}
+
 function envFlagEnabled(name: string): boolean {
   const value = String(process.env[name] || '').trim().toLowerCase()
   return ['1', 'true', 'yes', 'on'].includes(value)
@@ -107,13 +166,12 @@ async function startRuntimeServicesBeforeListen(): Promise<void> {
   if (gatewayAutostartDisabled()) {
     console.log('[bootstrap] profile gateway check disabled by HERMES_WEB_UI_DISABLE_GATEWAY_AUTOSTART')
   } else {
-    try {
-      await ensureProfileGatewaysRunning()
-      console.log('[bootstrap] profile gateways checked')
-    } catch (err) {
-      logger.warn(err, '[bootstrap] failed to ensure profile gateways')
-      console.warn('[bootstrap] failed to ensure profile gateways:', err instanceof Error ? err.message : err)
-    }
+    void ensureProfileGatewaysRunning()
+      .then(() => console.log('[bootstrap] profile gateways checked'))
+      .catch((err) => {
+        logger.warn(err, '[bootstrap] failed to ensure profile gateways')
+        console.warn('[bootstrap] failed to ensure profile gateways:', err instanceof Error ? err.message : err)
+      })
   }
 
   try {
@@ -214,20 +272,25 @@ export async function bootstrap() {
   }
 
   const app = new Koa()
-  await new Promise(resolve => setTimeout(resolve, 1000))
   // Initialize all web-ui SQLite tables
   const { initAllStores } = await import('./db/hermes/init')
-  // Wait 1 second before initializing stores to ensure all resources are ready
   initAllStores()
-  await new Promise(resolve => setTimeout(resolve, 1000))
   console.log('[bootstrap] all stores initialized')
 
   app.use(securityHeaders())
   app.use(cors({ origin: createCorsOriginResolver(config.corsOrigins) }))
   // Raise body limits above the default 1mb: profile avatars and MiMo voice-clone
   // reference audio are posted as base64 data URLs before reaching handlers.
-  app.use(bodyParser({ encoding: 'utf-8', jsonLimit: '20mb', formLimit: '20mb', textLimit: '20mb' }))
+  app.use(bodyParser({
+    encoding: 'utf-8',
+    jsonLimit: '20mb',
+    formLimit: '20mb',
+    textLimit: '20mb',
+    parsedMethods: ['POST', 'PUT', 'PATCH', 'DELETE'],
+  }))
   console.log('[bootstrap] cors + bodyParser registered')
+
+  registerDesktopShutdownRoute(app)
 
   // Register all routes (handles auth internally)
   const proxyMiddleware = registerRoutes(app, [requireUserJwt, resolveUserProfile])
@@ -236,6 +299,7 @@ export async function bootstrap() {
 
   // SPA fallback
   const distDir = resolve(__dirname, '..', 'client')
+  app.use(createStaticCompressionMiddleware())
   app.use(serve(distDir))
   app.use(async (ctx) => {
     if (!ctx.path.startsWith('/api') &&
@@ -310,7 +374,7 @@ export async function bootstrap() {
     })
   })
 
-  bindShutdown(servers, groupChatServer, chatRunServer, agentBridgeManager)
+  desktopShutdownHandler = bindShutdown(servers, groupChatServer, chatRunServer, agentBridgeManager)
   startVersionCheck()
 }
 

@@ -217,6 +217,10 @@ function providerShouldFetchLiveModels(providerKey: string): boolean {
     providerKey === 'nvidia'
 }
 
+function providerSupportsStoredOAuth(providerKey: string): boolean {
+  return providerKey === 'claude-oauth'
+}
+
 function includeConfiguredDefaultModel(providerKey: string, modelsList: string[], currentDefault: string, currentDefaultProvider: string): string[] {
   if (!currentDefault || providerKey !== currentDefaultProvider) return modelsList
   return [...new Set([...modelsList, currentDefault])]
@@ -360,7 +364,8 @@ async function buildAvailableForProfile(
   }
 
   for (const [providerKey, envMapping] of Object.entries(PROVIDER_ENV_MAP)) {
-    if (envMapping.api_key_env && !envHasValue(envMapping.api_key_env)) continue
+    const oauthAuthorized = providerSupportsStoredOAuth(providerKey) ? isOAuthAuthorized(providerKey) : false
+    if (envMapping.api_key_env && !envHasValue(envMapping.api_key_env) && !oauthAuthorized) continue
     if (!envMapping.api_key_env) {
       if (providerKey === 'copilot') {
         if (!copilotEnabled) continue
@@ -598,7 +603,8 @@ export async function getAvailable(ctx: any) {
     }
 
     for (const [providerKey, envMapping] of Object.entries(PROVIDER_ENV_MAP)) {
-      if (envMapping.api_key_env && !envHasValue(envMapping.api_key_env)) continue
+      const oauthAuthorized = providerSupportsStoredOAuth(providerKey) ? isOAuthAuthorized(providerKey) : false
+      if (envMapping.api_key_env && !envHasValue(envMapping.api_key_env) && !oauthAuthorized) continue
       if (!envMapping.api_key_env) {
         if (providerKey === 'copilot') {
           if (!copilotEnabled) continue

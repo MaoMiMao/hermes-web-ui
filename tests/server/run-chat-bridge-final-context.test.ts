@@ -582,6 +582,65 @@ describe('bridge run final context usage', () => {
     )
   })
 
+  it('persists expanded skill prompts as user history with visible command display fields', async () => {
+    const emit = vi.fn()
+    const nsp = makeNamespace(emit)
+    const socket = makeSocket()
+    const state = makeState()
+    const sessionMap = new Map([['session-1', state]])
+    const bridge = {
+      chat: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'started' }),
+      contextEstimate: vi.fn().mockResolvedValue({
+        token_count: 12345,
+        message_count: 2,
+        tool_count: 4,
+        system_prompt_chars: 13,
+      }),
+      streamOutput: vi.fn(async function* () {
+        yield { run_id: 'run-1', done: true, status: 'completed', output: 'done' }
+      }),
+    } as any
+
+    const { handleBridgeRun } = await import('../../packages/server/src/services/hermes/run-chat/handle-bridge-run')
+    await handleBridgeRun(
+      nsp,
+      socket,
+      {
+        input: '[IMPORTANT: expanded skill prompt]',
+        display_input: '/skill github-pr-review check PR 123',
+        display_role: 'command',
+        storage_message: '[IMPORTANT: expanded skill prompt]',
+        session_id: 'session-1',
+      },
+      'default',
+      sessionMap,
+      bridge,
+      false,
+      vi.fn(),
+      vi.fn(),
+    )
+
+    expect(state.messages.find((message: any) => message.content === '[IMPORTANT: expanded skill prompt]')).toEqual(expect.objectContaining({
+      role: 'user',
+      display_role: 'command',
+      display_content: '/skill github-pr-review check PR 123',
+    }))
+    expect(addMessageMock).toHaveBeenCalledWith(expect.objectContaining({
+      role: 'user',
+      content: '[IMPORTANT: expanded skill prompt]',
+      display_role: 'command',
+      display_content: '/skill github-pr-review check PR 123',
+    }))
+    expect(bridge.chat).toHaveBeenCalledWith(
+      'session-1',
+      '[IMPORTANT: expanded skill prompt]',
+      expect.any(Array),
+      expect.any(String),
+      'default',
+      expect.objectContaining({ storage_message: '[IMPORTANT: expanded skill prompt]' }),
+    )
+  })
+
   it('refreshes full context tokens when a bridge run fails', async () => {
     const emit = vi.fn()
     const nsp = makeNamespace(emit)

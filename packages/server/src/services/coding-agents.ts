@@ -3,7 +3,7 @@ import { randomUUID } from 'crypto'
 import { existsSync, readdirSync, realpathSync } from 'fs'
 import { chmod, mkdir, readFile, stat, writeFile } from 'fs/promises'
 import { homedir } from 'os'
-import { delimiter, dirname, extname, join } from 'path'
+import { delimiter, dirname, join } from 'path'
 import { promisify } from 'util'
 import { getWebUiHome } from '../config'
 import { PROVIDER_ENV_MAP, readConfigYamlForProfile, safeReadFile } from './config-helpers'
@@ -16,6 +16,7 @@ import { getProfileDir } from './hermes/hermes-profile'
 import { codingAgentRunManager } from './agent-runner/coding-agent-run-manager'
 import { getSession, updateSession, type HermesSessionRow } from '../db/hermes/session-store'
 import type { SessionState } from './hermes/run-chat/types'
+import { normalizeWindowsCommandPath, windowsCmdShimExecution, windowsCommandNeedsShell, type WindowsCommandExecution } from './windows-command'
 
 const execFileAsync = promisify(execFile)
 const LAUNCH_API_MODES = new Set<ApiMode>(['chat_completions', 'codex_responses', 'anthropic_messages'])
@@ -25,7 +26,15 @@ const CODEX_CATALOG_BASE_INSTRUCTIONS = 'You are Codex, a coding agent. Be preci
 const NODE_ENVIRONMENT_MISSING_CODE = 'node_environment_missing'
 const POSIX_LAUNCHER_FILE = 'launch.sh'
 const WINDOWS_LAUNCHER_FILE = 'launch.ps1'
-const CODING_AGENT_SCOPED_AUTH_PROVIDERS = new Set(['openai-codex', 'copilot', 'xai-oauth', 'nous'])
+const CODING_AGENT_SCOPED_AUTH_PROVIDERS = new Set(['openai-codex', 'copilot', 'xai-oauth', 'nous', 'google-gemini-cli', 'claude-oauth'])
+const CLAUDE_CODE_SKIP_PERMISSIONS_ARGS = ['--dangerously-skip-permissions']
+const CLAUDE_CODE_ROOT_PERMISSION_ARGS = ['--permission-mode', 'auto']
+
+interface CommandExecution {
+  command: string
+  args: string[]
+  windowsVerbatimArguments?: WindowsCommandExecution['windowsVerbatimArguments']
+}
 
 export type CodingAgentId = 'claude-code' | 'codex'
 
@@ -148,6 +157,7 @@ const CONFIG_FILE_DEFINITIONS: Record<CodingAgentId, Array<Omit<CodingAgentConfi
 const installingTools = new Set<CodingAgentId>()
 const deletingTools = new Set<CodingAgentId>()
 let cachedGlobalNpmBin: string | null | undefined
+let cachedLoginShellPath: string | null | undefined
 const MAX_CONFIG_FILE_SIZE = parseInt(process.env.MAX_EDIT_SIZE || '', 10) || 10 * 1024 * 1024
 
 function getNodeBinDir() {
@@ -213,6 +223,81 @@ function getNvmNodeBinPaths(): string {
       .join(delimiter)
   } catch {
     return ''
+  }
+}
+
+function getLoginShellCandidates(): string[] {
+  if (process.platform === 'win32') return []
+  return [
+    process.env.SHELL || '',
+    '/bin/zsh',
+    '/bin/bash',
+    '/usr/bin/zsh',
+    '/usr/bin/bash',
+  ].filter(Boolean)
+}
+
+function getLoginShell(): string | null {
+  for (const shell of [...new Set(getLoginShellCandidates())]) {
+    if (shell.startsWith('/') && existsSync(shell)) return shell
+  }
+  return null
+}
+
+async function getLoginShellPath(): Promise<string | null> {
+  if (process.env.HERMES_DESKTOP !== 'true' || process.platform === 'win32') return null
+  if (typeof cachedLoginShellPath !== 'undefined') return cachedLoginShellPath
+
+  const shell = getLoginShell()
+  if (!shell) {
+    cachedLoginShellPath = null
+    return cachedLoginShellPath
+  }
+
+  try {
+    const { stdout } = await execFileAsync(shell, ['-lc', 'printf %s "$PATH"'], {
+      encoding: 'utf-8',
+      timeout: 3000,
+      windowsHide: true,
+    })
+    cachedLoginShellPath = stdout.trim() || null
+  } catch {
+    cachedLoginShellPath = null
+  }
+  return cachedLoginShellPath
+}
+
+function getDesktopCommonBinPaths(): string[] {
+  if (process.env.HERMES_DESKTOP !== 'true' || process.platform === 'win32') return []
+  const home = homedir()
+  return [
+    join(home, '.npm-global', 'bin'),
+    join(home, '.local', 'bin'),
+    join(home, '.yarn', 'bin'),
+    join(home, '.config', 'yarn', 'global', 'node_modules', '.bin'),
+    join(home, '.pnpm'),
+    join(home, 'Library', 'pnpm'),
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+  ]
+}
+
+function prependPathEntries(env: NodeJS.ProcessEnv, entries: Array<string | null | undefined>) {
+  const pathKey = Object.keys(env).find(key => key.toLowerCase() === 'path') || 'PATH'
+  const currentPath = env[pathKey] || ''
+  const existing = new Set(currentPath.split(delimiter).filter(Boolean))
+  const prepended: string[] = []
+
+  for (const entry of entries) {
+    if (!entry) continue
+    for (const segment of entry.split(delimiter).map(item => item.trim()).filter(Boolean)) {
+      if (existing.has(segment) || prepended.includes(segment)) continue
+      prepended.push(segment)
+    }
+  }
+
+  if (prepended.length > 0) {
+    env[pathKey] = currentPath ? `${prepended.join(delimiter)}${delimiter}${currentPath}` : prepended.join(delimiter)
   }
 }
 
@@ -344,6 +429,19 @@ function inferLaunchApiMode(provider: string, baseUrl: string, fallback: ApiMode
     return 'chat_completions'
   }
   return fallback
+}
+
+function isScopedCodingAgentAuthProvider(provider: string, apiKey = ''): boolean {
+  const providerKey = String(provider || '').trim().toLowerCase()
+  return CODING_AGENT_SCOPED_AUTH_PROVIDERS.has(providerKey)
+}
+
+function assertScopedCodingAgentProviderAllowed(mode: CodingAgentLaunchResult['mode'], provider: string, apiKey = ''): void {
+  if (mode === 'global') return
+  if (!isScopedCodingAgentAuthProvider(provider, apiKey)) return
+  const err = new Error('Coding agent scoped mode does not support OAuth/subscription providers. Use global mode or select an API-key provider.')
+  ;(err as any).status = 400
+  throw err
 }
 
 async function resolveStoredProviderLaunchInput(
@@ -507,7 +605,7 @@ function codexCatalogEntry(input: {
       },
     },
     supports_reasoning_summaries: true,
-    default_reasoning_summary: 'none',
+    default_reasoning_summary: 'auto',
     support_verbosity: true,
     default_verbosity: 'low',
     apply_patch_tool_type: 'freeform',
@@ -541,6 +639,17 @@ function buildCodexModelCatalog(input: {
   }
 }
 
+function hasRootPrivileges(): boolean {
+  if (process.platform === 'win32') return false
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null
+  const euid = typeof process.geteuid === 'function' ? process.geteuid() : null
+  return uid === 0 || euid === 0
+}
+
+function claudeCodePermissionArgs(): string[] {
+  return hasRootPrivileges() ? CLAUDE_CODE_ROOT_PERMISSION_ARGS : CLAUDE_CODE_SKIP_PERMISSIONS_ARGS
+}
+
 function expandHomePath(path: string): string {
   if (path === '~') return homedir()
   if (path.startsWith('~/')) return join(homedir(), path.slice(2))
@@ -554,10 +663,6 @@ function shellQuote(value: string): string {
 
 function powerShellQuote(value: string): string {
   return `'${value.replace(/'/g, "''")}'`
-}
-
-function cmdQuote(value: string): string {
-  return `"${value.replace(/"/g, '""')}"`
 }
 
 function buildLaunchShellCommand(input: {
@@ -798,7 +903,7 @@ function getCurrentNodeEnv(): NodeJS.ProcessEnv {
   }
 }
 
-async function npmExecution(args: string[], env: NodeJS.ProcessEnv): Promise<{ command: string; args: string[] }> {
+async function npmExecution(args: string[], env: NodeJS.ProcessEnv): Promise<CommandExecution> {
   const bundledNpmCli = getNpmCliPath()
   if (bundledNpmCli) return { command: process.execPath, args: [bundledNpmCli, ...args] }
 
@@ -838,6 +943,7 @@ async function runNpm(args: string[], options: { timeout?: number; env?: NodeJS.
     encoding: 'utf-8',
     timeout: options.timeout,
     windowsHide: true,
+    windowsVerbatimArguments: execution.windowsVerbatimArguments,
     maxBuffer: 10 * 1024 * 1024,
     env,
   })
@@ -865,15 +971,10 @@ async function findCommandPaths(command: string, env: NodeJS.ProcessEnv): Promis
       windowsHide: true,
       env,
     })
-    return stdout.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
+    return stdout.split(/\r?\n/).map(line => normalizeWindowsCommandPath(line.trim())).filter(Boolean)
   } catch {
     return []
   }
-}
-
-function windowsCommandNeedsShell(command: string): boolean {
-  const extension = extname(command).toLowerCase()
-  return extension === '.cmd' || extension === '.bat'
 }
 
 async function resolveCommandForExecution(command: string, env: NodeJS.ProcessEnv): Promise<string> {
@@ -885,18 +986,12 @@ async function resolveCommandForExecution(command: string, env: NodeJS.ProcessEn
   return windowsPath || paths[0] || command
 }
 
-function commandExecution(command: string, args: string[]): { command: string; args: string[] } {
-  if (process.platform === 'win32' && windowsCommandNeedsShell(command)) {
-    // For CMD /C, the command and args need to be passed as a single string
-    // The command path should be quoted if it contains spaces, but args are joined directly
-    const commandArg = / /.test(command) ? `"${command}"` : command
-    const argsString = args.map(arg => / /.test(arg) ? `"${arg}"` : arg).join(' ')
-    return {
-      command: 'cmd.exe',
-      args: ['/d', '/s', '/c', `${commandArg} ${argsString}`],
-    }
+function commandExecution(command: string, args: string[]): CommandExecution {
+  const normalizedCommand = normalizeWindowsCommandPath(command)
+  if (process.platform === 'win32' && windowsCommandNeedsShell(normalizedCommand)) {
+    return windowsCmdShimExecution(normalizedCommand, args)
   }
-  return { command, args }
+  return { command: normalizedCommand, args }
 }
 
 function packageParts(packageName: string): string[] {
@@ -961,13 +1056,12 @@ async function getGlobalNpmBin(): Promise<string | null> {
 async function commandEnv(): Promise<NodeJS.ProcessEnv> {
   const env = getCurrentNodeEnv()
   const npmBin = await getGlobalNpmBin()
-  if (npmBin) {
-    const pathKey = Object.keys(env).find(key => key.toLowerCase() === 'path') || 'PATH'
-    const currentPath = env[pathKey] || ''
-    if (!currentPath.split(delimiter).includes(npmBin)) {
-      env[pathKey] = currentPath ? `${npmBin}${delimiter}${currentPath}` : npmBin
-    }
-  }
+  const loginShellPath = await getLoginShellPath()
+  prependPathEntries(env, [
+    npmBin,
+    loginShellPath,
+    ...getDesktopCommonBinPaths(),
+  ])
   return env
 }
 
@@ -999,6 +1093,7 @@ export async function getCodingAgentStatus(definition: CodingAgentDefinition): P
       encoding: 'utf-8',
       timeout: 8000,
       windowsHide: true,
+      windowsVerbatimArguments: execution.windowsVerbatimArguments,
       env,
     })
     const rawVersion = `${stdout || ''}${stderr || ''}`.trim()
@@ -1201,7 +1296,7 @@ export async function prepareCodingAgentLaunch(id: string, input: CodingAgentLau
   if (mode === 'global') {
     const scope = normalizeConfigScope({ profile: input.profile, provider: 'global' })
     const workspaceDir = resolveLaunchWorkspaceRoot(scope, input.workspace)
-    const args = tool.id === 'claude-code' ? ['--dangerously-skip-permissions'] : []
+    const args = tool.id === 'claude-code' ? claudeCodePermissionArgs() : []
     await mkdir(workspaceDir, { recursive: true })
     const shellCommand = buildLaunchShellCommand({
       workspaceDir,
@@ -1228,6 +1323,8 @@ export async function prepareCodingAgentLaunch(id: string, input: CodingAgentLau
   const provider = normalizeScopeSegment(input.provider, 'default', 'provider')
   const scope = normalizeConfigScope({ profile: input.profile, provider })
   const model = String(input.model || '').trim()
+  const apiKey = String(input.apiKey || '').trim()
+  assertScopedCodingAgentProviderAllowed(mode, provider, apiKey)
   if (!model) {
     const err = new Error('Model is required')
     ;(err as any).status = 400
@@ -1235,7 +1332,6 @@ export async function prepareCodingAgentLaunch(id: string, input: CodingAgentLau
   }
 
   const baseUrl = String(input.baseUrl || '').trim()
-  const apiKey = String(input.apiKey || '').trim()
   const preset = PROVIDER_PRESETS.find(item => item.value === provider)
   const apiMode = normalizeLaunchApiMode(input.apiMode, preset?.api_mode || 'chat_completions')
   const rootDir = getScopedConfigRoot(tool.id, scope)
@@ -1299,7 +1395,7 @@ export async function prepareCodingAgentLaunch(id: string, input: CodingAgentLau
       ...(input.isolateSettings ? ['--setting-sources', 'local'] : []),
       '--mcp-config',
       mcpPath,
-      '--dangerously-skip-permissions',
+      ...claudeCodePermissionArgs(),
     ]
   } else {
     if (apiMode !== 'chat_completions' && apiMode !== 'codex_responses' && apiMode !== 'anthropic_messages') {
@@ -1328,6 +1424,7 @@ export async function prepareCodingAgentLaunch(id: string, input: CodingAgentLau
       `model_catalog_json = ${JSON.stringify(catalogPath)}`,
       `model_provider = ${JSON.stringify(providerId)}`,
       `model = ${JSON.stringify(model)}`,
+      'model_reasoning_summary = "auto"',
       'disable_response_storage = true',
       '',
       `[model_providers.${providerId}]`,
@@ -1428,6 +1525,15 @@ export async function startCodingAgentRun(
     agentSessionId,
     isolateSettings: true,
   })
+  const runtimeEnv = process.platform === 'win32'
+    ? {
+        ...(await commandEnv()),
+        ...launch.env,
+      }
+    : launch.env
+  const runtimeCommand = process.platform === 'win32'
+    ? await resolveCommandForExecution(launch.command, runtimeEnv)
+    : launch.command
   const persistedProvider = String(resolvedInput.provider || launch.provider || '').trim() || launch.provider
   const started = codingAgentRunManager.start({
     agentSessionId,
@@ -1439,11 +1545,11 @@ export async function startCodingAgentRun(
     sessionId,
     agentNativeSessionId,
     nativeResume: Boolean(existingNativeSessionId),
-    command: launch.command,
+    command: runtimeCommand,
     args: launch.args,
     shellCommand: launch.shellCommand,
     workspaceDir: launch.workspaceDir,
-    env: launch.env,
+    env: runtimeEnv,
     state,
   })
   updateSession(sessionId, {

@@ -22,11 +22,13 @@ export const PROVIDER_ENV_MAP: Record<string, { api_key_env: string; base_url_en
   alibaba: { api_key_env: 'DASHSCOPE_API_KEY', base_url_env: 'DASHSCOPE_BASE_URL' },
   'alibaba-coding-plan': { api_key_env: 'ALIBABA_CODING_PLAN_API_KEY', base_url_env: 'ALIBABA_CODING_PLAN_BASE_URL' },
   anthropic: { api_key_env: 'ANTHROPIC_API_KEY', base_url_env: 'ANTHROPIC_BASE_URL' },
+  'claude-oauth': { api_key_env: '', base_url_env: '' },
   xai: { api_key_env: 'XAI_API_KEY', base_url_env: 'XAI_BASE_URL' },
   'xai-oauth': { api_key_env: '', base_url_env: '' },
   xiaomi: { api_key_env: 'XIAOMI_API_KEY', base_url_env: 'XIAOMI_BASE_URL' },
   'xiaomi-token-plan': { api_key_env: 'XIAOMI_TOKEN_PLAN_API_KEY', base_url_env: 'XIAOMI_TOKEN_PLAN_BASE_URL' },
   gemini: { api_key_env: 'GEMINI_API_KEY', base_url_env: 'GEMINI_BASE_URL' },
+  'google-gemini-cli': { api_key_env: '', base_url_env: '' },
   kilocode: { api_key_env: 'KILO_API_KEY', base_url_env: 'KILOCODE_BASE_URL' },
   'ai-gateway': { api_key_env: 'AI_GATEWAY_API_KEY', base_url_env: 'AI_GATEWAY_BASE_URL' },
   cliproxyapi: { api_key_env: '', base_url_env: '' },
@@ -103,20 +105,6 @@ export async function updateConfigYamlForProfile<T = void>(
   updater: (config: Record<string, any>) => Record<string, any> | { data: Record<string, any>; result: T; write?: boolean } | Promise<Record<string, any> | { data: Record<string, any>; result: T; write?: boolean }>,
 ): Promise<T | undefined> {
   return safeFileStore.updateYaml(configPathForProfile(profile), updater, { backup: true })
-}
-
-export function stripLegacyApiServerGatewayConfig(config: Record<string, any>): { config: Record<string, any>; changed: boolean } {
-  if (!config.platforms || typeof config.platforms !== 'object' || Array.isArray(config.platforms)) {
-    return { config, changed: false }
-  }
-
-  if (config.platforms.api_server !== undefined) {
-    delete config.platforms.api_server
-    if (Object.keys(config.platforms).length === 0) delete config.platforms
-    return { config, changed: true }
-  }
-
-  return { config, changed: false }
 }
 
 // --- .env helpers ---
@@ -249,6 +237,11 @@ export async function fetchProviderModels(baseUrl: string, apiKey: string, freeO
       return []
     }
     let models = data.data.map(m => m.id)
+    // Gemini returns model IDs with "models/" prefix. Strip to avoid double
+    // prefix when Hermes native adapter constructs .../models/{model}:generateContent
+    if (base.includes('generativelanguage.googleapis.com')) {
+      models = models.map(m => m.startsWith('models/') ? m.slice('models/'.length) : m)
+    }
     if (freeOnly) models = models.filter(m => m.endsWith(':free'))
     return models.sort()
   } catch (err: any) {

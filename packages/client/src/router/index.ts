@@ -101,6 +101,7 @@ const router = createRouter({
       path: '/hermes/terminal',
       name: 'hermes.terminal',
       component: () => import('@/views/hermes/TerminalView.vue'),
+      meta: { requiresSuperAdmin: true },
     },
     {
       path: '/hermes/devices',

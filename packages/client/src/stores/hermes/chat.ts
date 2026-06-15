@@ -3,15 +3,19 @@ import { deleteSession as deleteSessionApi, fetchSessionMessagesPage, fetchSessi
 import { getActiveProfileName } from '@/api/client'
 import { getDownloadUrl } from '@/api/hermes/download'
 import { defineStore } from 'pinia'
-import { ref, computed } from 'vue'
+import { ref, computed, watch } from 'vue'
 import { useAppStore } from './app'
 import { useProfilesStore } from './profiles'
 import { useSettingsStore } from './settings'
 import { primeCompletionSound, playCompletionSound } from '@/utils/completion-sound'
+import { showCompletionNotification } from '@/utils/completion-notification'
 import { detectThinkingBoundary } from '@/utils/thinking-parser'
 
 // Re-export ContentBlock for convenience
 export type ContentBlock = ContentBlockImport
+
+export const LIVE_CHAT_MESSAGE_PAGE_SIZE = 150
+export const LIVE_CHAT_MAX_LOADED_MESSAGES = 300
 
 export interface Attachment {
   id: string
@@ -56,6 +60,7 @@ export interface PendingApproval {
   description: string
   choices: Array<'once' | 'session' | 'always' | 'deny'>
   allowPermanent: boolean
+  isMemoryWrite: boolean
   requestedAt: number
 }
 
@@ -97,6 +102,10 @@ export interface Session {
   endedAt?: number | null
   lastActiveAt?: number
   workspace?: string | null
+  /** Per-session reasoning effort override.
+   * Empty string / undefined = use config.yaml default.
+   * Values: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' */
+  reasoningEffort?: string
 }
 
 interface CompressionState {
@@ -125,6 +134,28 @@ function isToolOutputError(output: unknown): boolean {
     return false
   }
   return false
+}
+
+function errorMessageText(error: unknown): string {
+  if (typeof error === 'string') return error.trim()
+  if (error == null) return ''
+  if (typeof error !== 'object') return String(error).trim()
+
+  if (Array.isArray(error)) {
+    return error.map(errorMessageText).filter(Boolean).join('\n')
+  }
+
+  const record = error as Record<string, unknown>
+  for (const key of ['message', 'error', 'detail', 'description', 'code']) {
+    const text = errorMessageText(record[key])
+    if (text) return text
+  }
+
+  try {
+    return JSON.stringify(error)
+  } catch {
+    return String(error)
+  }
 }
 
 async function uploadFiles(attachments: Attachment[]): Promise<{ name: string; path: string }[]> {
@@ -384,13 +415,15 @@ function mapHermesMessages(msgs: HermesMessage[]): Message[] {
     }
 
     // Normal user/assistant/command messages
+    const displayRole = msg.display_role || msg.role
+    const displayContent = msg.display_content ?? msg.content
     result.push({
       id: String(msg.id),
-      role: msg.role,
-      content: msg.content || '',
+      role: displayRole,
+      content: displayContent || '',
       timestamp: Math.round(msg.timestamp * 1000),
       reasoning: msg.reasoning ? msg.reasoning : undefined,
-      systemType: msg.role === 'command' ? 'command' : undefined,
+      systemType: displayRole === 'command' ? 'command' : undefined,
       finishReason: readFinishReason(msg),
       runMarker: readRunMarker(msg),
     })
@@ -524,6 +557,8 @@ export const useChatStore = defineStore('chat', () => {
   const streamStates = ref<Map<string, { abort: () => void }>>(new Map())
   /** sessionId → server-reported isWorking status */
   const serverWorking = ref<Set<string>>(new Set())
+  /** Sessions that completed while the user was viewing another session. */
+  const completedUnreadSessions = ref<Set<string>>(new Set())
   const sessionProfileFilter = ref<string | null>(null)
   /** sessionId → queued message count */
   const queueLengths = ref<Map<string, number>>(new Map())
@@ -595,6 +630,35 @@ export const useChatStore = defineStore('chat', () => {
     return streamStates.value.has(sessionId) || serverWorking.value.has(sessionId)
   }
 
+  function isSessionCompletedUnread(sessionId: string): boolean {
+    return completedUnreadSessions.value.has(sessionId)
+  }
+
+  function clearSessionCompletedUnread(sessionId: string) {
+    if (!completedUnreadSessions.value.has(sessionId)) return
+    const next = new Set(completedUnreadSessions.value)
+    next.delete(sessionId)
+    completedUnreadSessions.value = next
+  }
+
+  function markSessionCompletedUnread(sessionId: string, hasQueue = false) {
+    if (hasQueue) {
+      return
+    }
+    if (activeSessionId.value === sessionId) {
+      clearSessionCompletedUnread(sessionId)
+      return
+    }
+    const next = new Set(completedUnreadSessions.value)
+    next.add(sessionId)
+    completedUnreadSessions.value = next
+  }
+
+  function pruneCompletedUnreadSessions(existingIds: Set<string>) {
+    const next = new Set([...completedUnreadSessions.value].filter(id => existingIds.has(id)))
+    if (next.size !== completedUnreadSessions.value.size) completedUnreadSessions.value = next
+  }
+
   function clearActiveSession() {
     const sid = activeSessionId.value
     activeSessionId.value = null
@@ -622,6 +686,7 @@ export const useChatStore = defineStore('chat', () => {
         if (prev?.contextTokens != null) s.contextTokens = prev.contextTokens
       }
       sessions.value = fresh
+      pruneCompletedUnreadSessions(new Set(sessions.value.map(s => s.id)))
 
       // Restore route-selected session first (tab-local source of truth),
       // then current in-memory session, then persisted legacy/default choice,
@@ -649,6 +714,80 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  // Refresh ONLY the session list metadata (titles, ordering, new/removed
+  // sessions) without switching the active session or reloading its messages.
+  // Used for live sync so sessions created elsewhere (CLI, Telegram, another
+  // device) appear without a manual reload. Skips while streaming to avoid
+  // churn.
+  //
+  // CRITICAL: this MERGES IN-PLACE into the existing session objects instead of
+  // replacing the array with `mapHermesSession` clones. `activeSession` is a ref
+  // bound to a specific object inside `sessions.value` (see switchSession), and
+  // streaming deltas mutate that same object via `sessions.value.find(...)`. If
+  // we swapped in fresh objects, `activeSession.value` would point at an orphan
+  // and live messages would stop appearing until a manual reload. Mutating the
+  // existing objects preserves referential identity so streaming keeps working.
+  async function refreshSessionListOnly(profile?: string | null): Promise<void> {
+    if (isStreaming.value) return
+    if (isLoadingSessions.value) return
+    try {
+      const list = await fetchSessions(undefined, undefined, profile ?? sessionProfileFilter.value ?? undefined)
+      const incoming = list.map(mapHermesSession)
+      const existingById = new Map(sessions.value.map(s => [s.id, s]))
+      const incomingIds = new Set(incoming.map(s => s.id))
+
+      // Build the next array reusing existing objects (identity-preserving) and
+      // inserting genuinely-new sessions as fresh objects.
+      const next: Session[] = []
+      for (const fresh of incoming) {
+        const existing = existingById.get(fresh.id)
+        if (existing) {
+          // Update scalar metadata in-place; never touch runtime/scroll state
+          // (messages, loadedMessageCount, hasMoreBefore, contextTokens).
+          existing.title = fresh.title
+          existing.source = fresh.source
+          existing.updatedAt = fresh.updatedAt
+          existing.lastActiveAt = fresh.lastActiveAt
+          existing.endedAt = fresh.endedAt
+          existing.model = fresh.model
+          existing.provider = fresh.provider
+          existing.messageCount = fresh.messageCount
+          existing.inputTokens = fresh.inputTokens
+          existing.outputTokens = fresh.outputTokens
+          existing.workspace = fresh.workspace
+          // messageTotal: keep the larger of server count vs what we've loaded,
+          // so we don't shrink below already-rendered messages mid-session.
+          if (fresh.messageTotal != null) {
+            existing.messageTotal = Math.max(fresh.messageTotal, existing.loadedMessageCount || 0)
+          }
+          next.push(existing)
+        } else {
+          next.push(fresh)
+        }
+      }
+
+      // Keep the active session even if the server no longer lists it (don't
+      // pull the rug out from under what the user is viewing).
+      const activeId = activeSessionId.value
+      if (activeId && !incomingIds.has(activeId)) {
+        const keep = existingById.get(activeId)
+        if (keep) next.push(keep)
+      }
+
+      sessions.value = next
+      pruneCompletedUnreadSessions(new Set(next.map(s => s.id)))
+
+      // Defensive: re-bind activeSession to the (same) object now in the array,
+      // by id, in case anything above changed array membership.
+      if (activeId) {
+        const again = sessions.value.find(s => s.id === activeId)
+        if (again && activeSession.value !== again) activeSession.value = again
+      }
+    } catch (err) {
+      console.error('Failed to refresh session list:', err)
+    }
+  }
+
   // Re-pull active session from server. Used on tab-visible events.
   async function refreshActiveSession(): Promise<boolean> {
     const sid = activeSessionId.value
@@ -656,7 +795,10 @@ export const useChatStore = defineStore('chat', () => {
     try {
       const target = sessions.value.find(s => s.id === sid)
       if (!target) return false
-      const limit = Math.max(target.loadedMessageCount || 300, 300)
+      const limit = Math.min(
+        Math.max(target.loadedMessageCount || LIVE_CHAT_MESSAGE_PAGE_SIZE, LIVE_CHAT_MESSAGE_PAGE_SIZE),
+        LIVE_CHAT_MAX_LOADED_MESSAGES,
+      )
       const detail = await fetchSessionMessagesPage(sid, 0, limit, activeSession.value?.profile)
       if (!detail) return false
       const mapped = mapHermesMessages(detail.messages || [])
@@ -745,6 +887,7 @@ export const useChatStore = defineStore('chat', () => {
     const legacyActiveKey = legacyStorageKey()
     if (legacyActiveKey) removeItem(legacyActiveKey)
     activeSession.value = sessions.value.find(s => s.id === sessionId) || null
+    clearSessionCompletedUnread(sessionId)
 
     if (!activeSession.value) return
 
@@ -912,7 +1055,8 @@ export const useChatStore = defineStore('chat', () => {
     const target = sessions.value.find(s => s.id === sessionId)
     if (!target || target.isLoadingOlderMessages || !target.hasMoreBefore) return false
     const offset = target.loadedMessageCount || 0
-    const limit = 300
+    if (offset >= LIVE_CHAT_MAX_LOADED_MESSAGES) return false
+    const limit = Math.min(LIVE_CHAT_MESSAGE_PAGE_SIZE, LIVE_CHAT_MAX_LOADED_MESSAGES - offset)
     target.isLoadingOlderMessages = true
     try {
       const page = await fetchSessionMessagesPage(sessionId, offset, limit, target.profile)
@@ -1113,8 +1257,9 @@ export const useChatStore = defineStore('chat', () => {
     })
   }
 
-  function addAgentErrorMessage(sessionId: string, error?: string | null) {
-    const content = error ? `Error: ${error}` : 'Run failed'
+  function addAgentErrorMessage(sessionId: string, error?: unknown) {
+    const message = errorMessageText(error)
+    const content = message ? `Error: ${message}` : 'Run failed'
     const msgs = getSessionMsgs(sessionId)
     const last = msgs[msgs.length - 1]
     if (last?.isStreaming) {
@@ -1410,6 +1555,13 @@ export const useChatStore = defineStore('chat', () => {
     const sid = evt.session_id
     const approvalId = (evt as any).approval_id as string | undefined
     if (!sid || !approvalId) return
+    const description = String((evt as any).description || '')
+    const normalizedDescription = description.trim().toLowerCase().replace(/\s+/g, ' ')
+    const isMemoryWrite = !Boolean((evt as any).allow_permanent) && (
+      normalizedDescription === 'save to memory' ||
+      normalizedDescription.startsWith('save to memory:') ||
+      normalizedDescription.startsWith('save to memory?')
+    )
     const rawChoices = Array.isArray((evt as any).choices) ? (evt as any).choices : ['once', 'session', 'deny']
     const choices = rawChoices
       .filter((choice: unknown): choice is PendingApproval['choices'][number] =>
@@ -1418,9 +1570,10 @@ export const useChatStore = defineStore('chat', () => {
       sessionId: sid,
       approvalId,
       command: String((evt as any).command || ''),
-      description: String((evt as any).description || ''),
-      choices: choices.length ? choices : ['once', 'session', 'deny'],
+      description,
+      choices: isMemoryWrite ? ['once', 'deny'] : choices.length ? choices : ['once', 'session', 'deny'],
       allowPermanent: Boolean((evt as any).allow_permanent),
+      isMemoryWrite,
       requestedAt: Date.now(),
     })
     pendingApprovals.value = new Map(pendingApprovals.value)
@@ -1537,6 +1690,47 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  function truncateNotificationText(value: string, maxLength: number): string {
+    const normalized = value.replace(/\s+/g, ' ').trim()
+    if (normalized.length <= maxLength) return normalized
+    return `${normalized.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`
+  }
+
+  function completionNotificationAgent(session: Session): { icon: string } {
+    const codingAgentId = session.codingAgentId || (session.agent === 'codex' ? 'codex' : session.agent === 'claude' ? 'claude-code' : undefined)
+    if (codingAgentId === 'codex') {
+      return { icon: '/coding-agents/codex-openai.png' }
+    }
+    if (codingAgentId === 'claude-code') {
+      return { icon: '/coding-agents/claude-code.svg' }
+    }
+    return { icon: '/coding-agents/hermes.png' }
+  }
+
+  function completionNotificationBody(session: Session, message?: Message): string {
+    const preview = message?.content || session.title || 'Message complete.'
+    return truncateNotificationText(preview, 140)
+  }
+
+  function showCompletionNotificationIfEnabled(sessionId: string, messageId?: string | null) {
+    const settingsStore = useSettingsStore()
+    if (!settingsStore.display.notify_on_complete) return
+
+    const session = sessions.value.find(s => s.id === sessionId)
+    if (!session) return
+    const message = messageId
+      ? session.messages.find(m => m.id === messageId)
+      : [...session.messages].reverse().find(m => m.role === 'assistant')
+
+    const agent = completionNotificationAgent(session)
+    void showCompletionNotification({
+      title: truncateNotificationText(session.title || 'Hermes', 80),
+      body: completionNotificationBody(session, message),
+      icon: agent.icon,
+      tag: `hermes-complete-${sessionId}-${message?.id || Date.now()}`,
+    })
+  }
+
   async function sendMessage(content: string, attachments?: Attachment[]) {
     if ((!content.trim() && !(attachments && attachments.length > 0))) return
 
@@ -1556,9 +1750,10 @@ export const useChatStore = defineStore('chat', () => {
     const isBridgeSlashCommand = !isCodingAgentSession && content.trim().startsWith('/')
     const isBridgeCompressCommand = isBridgeSlashCommand && /^\/compress(?:\s|$)/i.test(content.trim())
     const isBridgePlanCommand = isBridgeSlashCommand && /^\/plan(?:\s|$)/i.test(content.trim())
+    const isBridgeSkillCommand = isBridgeSlashCommand && /^\/skill(?:\s|$)/i.test(content.trim())
     const isBridgeGoalCommand = isBridgeSlashCommand && /^\/goal(?:\s|$)/i.test(content.trim())
     const wasLiveBeforeSend = isSessionLive(sid)
-    const shouldQueue = wasLiveBeforeSend && (!isBridgeSlashCommand || isBridgePlanCommand)
+    const shouldQueue = wasLiveBeforeSend && (!isBridgeSlashCommand || isBridgePlanCommand || isBridgeSkillCommand)
 
     const userMsg: Message = {
       id: uid(),
@@ -1656,6 +1851,9 @@ export const useChatStore = defineStore('chat', () => {
               apiMode: codingAgentMode === 'global' ? undefined : activeSession.value?.apiMode || providerGroup?.api_mode || undefined,
             }
           : {}),
+        // Per-session reasoning effort override. Coding Agent runners do not
+        // consume this setting yet, so keep their payloads explicit.
+        reasoning_effort: sessionSource === 'coding_agent' ? undefined : activeSession.value?.reasoningEffort || undefined,
       }
       if (shouldSendInitialSessionConfig && activeSession.value) {
         activeSession.value.messageCount = Math.max(activeSession.value.messageCount || 0, 1)
@@ -1841,6 +2039,7 @@ export const useChatStore = defineStore('chat', () => {
           if (eventRunMarker) activeRunMarker = eventRunMarker
           switch (evt.event) {
             case 'run.started':
+              clearSessionCompletedUnread(sid)
               serverWorking.value.add(sid)
               clearAgentEventMessages(sid)
               setAbortState(null)
@@ -2233,6 +2432,7 @@ export const useChatStore = defineStore('chat', () => {
                 })
               } else {
                 playCompletionBellIfEnabled()
+                showCompletionNotificationIfEnabled(sid, completedAssistantMessageId)
               }
 
               // 自动播放语音
@@ -2247,7 +2447,9 @@ export const useChatStore = defineStore('chat', () => {
                 }
               }
 
-              if ((evt as any).queue_remaining > 0) {
+              const hasQueue = (evt as any).queue_remaining > 0
+              markSessionCompletedUnread(sid, hasQueue)
+              if (hasQueue) {
                 queueLengths.value.set(sid, (evt as any).queue_remaining)
               } else {
                 cleanup()
@@ -2435,6 +2637,7 @@ export const useChatStore = defineStore('chat', () => {
         }
 
         case 'run.started':
+          clearSessionCompletedUnread(sid)
           serverWorking.value.add(sid)
           clearAgentEventMessages(sid)
           setAbortState(null)
@@ -2783,6 +2986,7 @@ export const useChatStore = defineStore('chat', () => {
             })
           } else {
             playCompletionBellIfEnabled()
+            showCompletionNotificationIfEnabled(sid, completedAssistantMessageId)
           }
 
           // Auto-play speech for every completed assistant message
@@ -2797,11 +3001,13 @@ export const useChatStore = defineStore('chat', () => {
           }
 
           if (!hasQueue) {
+            markSessionCompletedUnread(sid)
             cleanup()
             activeAssistantMessageId = null
             reasoningAssistantMessageId = null
             activeRunMarker = null
           } else {
+            markSessionCompletedUnread(sid, true)
             // More runs pending — reset for next run but don't cleanup
             activeAssistantMessageId = null
             reasoningAssistantMessageId = null
@@ -2978,6 +3184,11 @@ export const useChatStore = defineStore('chat', () => {
   // Tab visibility: re-sync when returning to foreground
   if (typeof document !== 'undefined') {
     document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && !isStreaming.value) {
+        // Live-sync the session list so sessions created elsewhere (CLI,
+        // Telegram, another device) appear without a manual reload.
+        void refreshSessionListOnly()
+      }
       if (document.visibilityState === 'visible' && activeSessionId.value && !isStreaming.value) {
         const sid = activeSessionId.value
         if (sid && !streamStates.value.has(sid)) {
@@ -3006,6 +3217,19 @@ export const useChatStore = defineStore('chat', () => {
         }
       }
     })
+  }
+
+  // Mild background polling for live session-list sync (covers sessions created
+  // on the VM via CLI/Telegram while this client is in the foreground). Only
+  // runs when the tab is visible and not streaming, so it's cheap and never
+  // disrupts an active run. visibilitychange (above) handles the wake-from-hidden
+  // case; this covers the "left it open and watching" case.
+  if (typeof window !== 'undefined') {
+    window.setInterval(() => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return
+      if (isStreaming.value) return
+      void refreshSessionListOnly()
+    }, 12_000)
   }
 
   // Transient observation of <think> boundaries during active streaming.
@@ -3059,6 +3283,42 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  // Persisted in localStorage keyed by sessionId so the choice survives
+  // page reloads. Cleared on session deletion is NOT implemented (best-effort
+  // — orphan keys are tiny and never read again).
+  const REASONING_LS_PREFIX = 'hermes:reasoning_effort:'
+  function setSessionReasoningEffort(sessionId: string, effort: string) {
+    const session = sessions.value.find(s => s.id === sessionId)
+    if (!session) return
+    session.reasoningEffort = effort || undefined
+    try {
+      if (effort) {
+        localStorage.setItem(REASONING_LS_PREFIX + sessionId, effort)
+      } else {
+        localStorage.removeItem(REASONING_LS_PREFIX + sessionId)
+      }
+    } catch {
+      // localStorage may be unavailable (private mode); silently ignore
+    }
+  }
+  function getStoredReasoningEffort(sessionId: string): string | undefined {
+    try {
+      return localStorage.getItem(REASONING_LS_PREFIX + sessionId) || undefined
+    } catch {
+      return undefined
+    }
+  }
+  // Hydrate reasoningEffort onto sessions whenever they come in fresh from
+  // the server (mapHermesSession doesn't carry this — it's client-only state).
+  watch(sessions, (list) => {
+    for (const s of list) {
+      if (s.reasoningEffort === undefined) {
+        const stored = getStoredReasoningEffort(s.id)
+        if (stored) s.reasoningEffort = stored
+      }
+    }
+  }, { deep: false })
+
   function clearThinkingObservationFor(_sessionId: string) {
     // messageId 与 sessionId 的关联未单独持有；方案是切会话时一律清空。
     // 这符合 spec 定义：observation 是"当前会话范围内"的 transient 状态。
@@ -3083,6 +3343,8 @@ export const useChatStore = defineStore('chat', () => {
     isStreaming,
     isRunActive,
     isSessionLive,
+    isSessionCompletedUnread,
+    clearSessionCompletedUnread,
     sessionProfileFilter,
     compressionState,
     abortState,
@@ -3110,6 +3372,7 @@ export const useChatStore = defineStore('chat', () => {
     respondApproval,
     respondToClarify,
     loadSessions,
+    refreshSessionListOnly,
     refreshActiveSession,
     getThinkingObservation,
     noteThinkingDelta,
@@ -3118,5 +3381,6 @@ export const useChatStore = defineStore('chat', () => {
     clearThinkingObservationFor,
     setAutoPlaySpeech,
     playMessageSpeech,
+    setSessionReasoningEffort,
   }
 })

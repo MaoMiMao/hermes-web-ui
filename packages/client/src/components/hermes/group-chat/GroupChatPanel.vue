@@ -1,15 +1,24 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
-import { useMessage, NInput, NButton, NSpace, NSelect, NPopover, NPopconfirm, NInputNumber, NDropdown, type DropdownOption } from 'naive-ui'
+import { useMessage, NInput, NButton, NSpace, NSelect, NPopover, NPopconfirm, NInputNumber, NDropdown, NModal, type DropdownOption } from 'naive-ui'
 import { useGroupChatStore } from '@/stores/hermes/group-chat'
 import { useProfilesStore } from '@/stores/hermes/profiles'
+import { useAppStore } from '@/stores/hermes/app'
 import { updateRoomConfig, forceCompress } from '@/api/hermes/group-chat'
 import GroupMessageList from './GroupMessageList.vue'
 import GroupChatInput from './GroupChatInput.vue'
 import ProfileAvatar from '@/components/hermes/profiles/ProfileAvatar.vue'
+import PageSidebarNav from '@/components/layout/PageSidebarNav.vue'
+import ProfileSelector from '@/components/layout/ProfileSelector.vue'
+import ModelSelector from '@/components/layout/ModelSelector.vue'
+import LanguageSwitch from '@/components/layout/LanguageSwitch.vue'
+import ThemeSwitch from '@/components/layout/ThemeSwitch.vue'
+import VersionManagementModal from '@/components/layout/VersionManagementModal.vue'
 import { copyToClipboard } from '@/utils/clipboard'
+import { getStoredUsername } from '@/api/client'
+import { changelog } from '@/data/changelog'
 import type { Attachment } from '@/stores/hermes/chat'
 import type { RoomAgent } from '@/api/hermes/group-chat'
 
@@ -18,12 +27,18 @@ const router = useRouter()
 const message = useMessage()
 const store = useGroupChatStore()
 const profilesStore = useProfilesStore()
+const appStore = useAppStore()
 
 const showSidebar = ref(window.innerWidth > 768)
 const showCreateModal = ref(false)
 const showCloneModal = ref(false)
 const showAddAgentModal = ref(false)
 const showCompressionModal = ref(false)
+const showChangelog = ref(false)
+const showVersionManagement = ref(false)
+const showSettingsPopover = ref(false)
+const profileModalOpen = ref(false)
+const modelModalOpen = ref(false)
 const compressionConfig = ref({ triggerTokens: 100000, maxHistoryTokens: 32000, tailMessageCount: 10 })
 const isCompressing = ref(false)
 const selectedProfile = ref<string | null>(null)
@@ -65,6 +80,10 @@ const userMemberAvatar = computed(() => {
     return null
 })
 const visibleApproval = computed(() => store.activePendingApproval)
+const currentUsername = computed(() => getStoredUsername())
+const isDesktopShell = computed(() =>
+    (window as typeof window & { hermesDesktop?: { isDesktop?: boolean } }).hermesDesktop?.isDesktop === true,
+)
 
 function formatTokens(tokens: number): string {
     if (tokens >= 1000) return `${(tokens / 1000).toFixed(1)}k tokens`
@@ -73,6 +92,45 @@ function formatTokens(tokens: number): string {
 
 function toggleSidebar() {
     showSidebar.value = !showSidebar.value
+}
+
+function openPageSidebar() {
+    showSidebar.value = true
+}
+
+function openSettingsPage() {
+    router.push({ name: 'hermes.settings' })
+}
+
+function openChangelog() {
+    showChangelog.value = true
+}
+
+function openVersionManagement() {
+    showVersionManagement.value = true
+}
+
+function handleReloadClient() {
+    appStore.reloadClient()
+}
+
+async function handleUpdate() {
+    const ok = await appStore.doUpdate()
+    if (ok) {
+        message.success(t('sidebar.updateSuccess'), { duration: 5000 })
+    } else {
+        message.error(t('sidebar.updateFailed'))
+    }
+}
+
+function handleLogout() {
+    localStorage.clear()
+    window.location.reload()
+}
+
+function handleSettingsPopoverShowChange(show: boolean) {
+    if (!show && (profileModalOpen.value || modelModalOpen.value)) return
+    showSettingsPopover.value = show
 }
 
 function generateCode(): string {
@@ -236,9 +294,14 @@ async function handleAddAgent() {
 }
 
 onMounted(() => {
+    window.addEventListener('hermes:open-page-sidebar', openPageSidebar)
     if (profilesStore.profiles.length === 0) {
         void profilesStore.fetchProfiles()
     }
+})
+
+onUnmounted(() => {
+    window.removeEventListener('hermes:open-page-sidebar', openPageSidebar)
 })
 
 async function confirmAddAgent() {
@@ -339,14 +402,11 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
         <!-- Room sidebar -->
         <div v-if="showSidebar" class="room-sidebar">
             <div class="sidebar-header">
-                <span class="sidebar-title">{{ t('groupChat.title') }}</span>
-                <div class="sidebar-actions">
-                    <button class="icon-btn" :title="t('groupChat.createRoom')" @click="showCreateModal = true">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-                            <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
-                        </svg>
-                    </button>
-                </div>
+                <PageSidebarNav
+                    active="group"
+                    :primary-label="t('groupChat.createRoom')"
+                    @primary="showCreateModal = true"
+                />
             </div>
             <div class="room-list">
                 <div
@@ -378,6 +438,103 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                     {{ t('groupChat.noRooms') }}
                 </div>
             </div>
+            <div class="page-sidebar-bottom">
+                <NPopover
+                    :show="showSettingsPopover"
+                    trigger="click"
+                    placement="top-start"
+                    :show-arrow="false"
+                    raw
+                    @update:show="handleSettingsPopoverShowChange"
+                >
+                    <template #trigger>
+                        <button class="page-sidebar-menu-btn" type="button">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                                <circle cx="12" cy="12" r="3" />
+                                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+                            </svg>
+                            <span>{{ t('sidebar.settings') }}</span>
+                        </button>
+                    </template>
+                    <div class="page-sidebar-popover">
+                        <ProfileSelector @modal-show-change="profileModalOpen = $event" />
+                        <ModelSelector @modal-show-change="modelModalOpen = $event" />
+                        <div class="page-sidebar-popover-row">
+                            <div
+                                class="status-indicator"
+                                :class="{ connected: appStore.connected, disconnected: !appStore.connected }"
+                            >
+                                <span class="status-dot"></span>
+                                <span class="status-text">{{ appStore.connected ? t('sidebar.connected') : t('sidebar.disconnected') }}</span>
+                            </div>
+                            <LanguageSwitch />
+                        </div>
+                        <div class="page-sidebar-version-row">
+                            <div class="page-sidebar-version-links">
+                                <a class="page-sidebar-link" href="https://github.com/EKKOLearnAI/hermes-studio" target="_blank" rel="noopener noreferrer" title="GitHub">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+                                </a>
+                                <a class="page-sidebar-link" href="https://hermes-studio.ai/" target="_blank" rel="noopener noreferrer" title="Website">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+                                </a>
+                            </div>
+                            <span
+                                class="page-sidebar-version-text"
+                                role="button"
+                                tabindex="0"
+                                @click="openChangelog"
+                                @keydown.enter="openChangelog"
+                                @keydown.space.prevent="openChangelog"
+                            >
+                                Studio v{{ appStore.serverVersion || '0.1.0' }}
+                            </span>
+                            <ThemeSwitch />
+                        </div>
+                        <button class="page-sidebar-nav-btn" type="button" @click="openSettingsPage">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                                <line x1="4" y1="6" x2="20" y2="6" />
+                                <line x1="4" y1="12" x2="20" y2="12" />
+                                <line x1="4" y1="18" x2="20" y2="18" />
+                            </svg>
+                            <span>{{ t('sidebar.settings') }}</span>
+                        </button>
+                        <button class="page-sidebar-logout-btn" type="button" @click="handleLogout">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+                                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                                <polyline points="16 17 21 12 16 7" />
+                                <line x1="21" y1="12" x2="9" y2="12" />
+                            </svg>
+                            <span>{{ t('sidebar.logout') }}</span>
+                            <span v-if="currentUsername" class="page-sidebar-logout-user" :title="currentUsername">
+                                {{ currentUsername }}
+                            </span>
+                        </button>
+                        <NButton v-if="isDesktopShell" type="primary" size="tiny" block @click="openVersionManagement">
+                            {{ t('sidebar.versionManagement') }}
+                        </NButton>
+                        <NButton v-if="appStore.clientOutdated" type="warning" size="tiny" block @click="handleReloadClient">
+                            {{ t('sidebar.reloadClientVersion', { version: appStore.serverVersion }) }}
+                        </NButton>
+                        <NButton v-if="appStore.updateAvailable" type="primary" size="tiny" block :loading="appStore.updating" @click="handleUpdate">
+                            {{ appStore.updating ? t('sidebar.updating') : t('sidebar.updateVersion', { version: appStore.latestVersion }) }}
+                        </NButton>
+                    </div>
+                </NPopover>
+                <NModal v-model:show="showChangelog" preset="dialog" :title="t('sidebar.changelog')" style="width: 520px;">
+                    <div class="changelog-list">
+                        <div v-for="entry in changelog" :key="entry.version" class="changelog-version-block">
+                            <div class="changelog-version-header">
+                                <span class="changelog-version-tag">v{{ entry.version }}</span>
+                                <span class="changelog-date">{{ entry.date }}</span>
+                            </div>
+                            <ul class="changelog-changes">
+                                <li v-for="(change, idx) in entry.changes" :key="idx">{{ t(change) }}</li>
+                            </ul>
+                        </div>
+                    </div>
+                </NModal>
+                <VersionManagementModal v-if="isDesktopShell" v-model:show="showVersionManagement" />
+            </div>
         </div>
 
         <NDropdown
@@ -394,7 +551,7 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
         <!-- Main chat area -->
         <div class="chat-main">
             <div class="chat-header">
-                <button class="icon-btn" @click="toggleSidebar">
+                <button class="icon-btn header-sidebar-toggle" @click="toggleSidebar">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
                         <rect x="3" y="3" width="18" height="18" rx="2" ry="2" /><line x1="9" y1="3" x2="9" y2="21" />
                     </svg>
@@ -471,7 +628,44 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
             </div>
 
             <template v-if="hasRoom">
-                <GroupMessageList />
+                <div class="group-message-shell">
+                    <GroupMessageList />
+                    <Transition name="approval-float">
+                        <div v-if="visibleApproval" class="approval-float-panel">
+                            <div class="approval-float-header">
+                                <span class="approval-float-icon" aria-hidden="true">
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10" />
+                                        <path d="m9 12 2 2 4-4" />
+                                    </svg>
+                                </span>
+                                <span>{{ t('chat.approvalKicker') }}</span>
+                            </div>
+                            <div class="approval-float-title">
+                                <span v-if="visibleApproval.agentName">@{{ visibleApproval.agentName }} · </span>{{ t('chat.approvalTitle') }}
+                            </div>
+                            <div class="approval-float-desc">{{ visibleApproval.description }}</div>
+                            <code class="approval-float-command">{{ visibleApproval.command }}</code>
+                            <div class="approval-float-actions">
+                                <NButton v-if="visibleApproval.isMemoryWrite" size="small" type="primary" @click="handleApproval('once')">
+                                    {{ t('chat.approvalAgree') }}
+                                </NButton>
+                                <NButton v-if="!visibleApproval.isMemoryWrite && visibleApproval.choices.includes('once')" size="small" type="primary" @click="handleApproval('once')">
+                                    {{ t('chat.approvalAllowOnce') }}
+                                </NButton>
+                                <NButton v-if="!visibleApproval.isMemoryWrite && visibleApproval.choices.includes('session')" size="small" secondary @click="handleApproval('session')">
+                                    {{ t('chat.approvalAllowSession') }}
+                                </NButton>
+                                <NButton v-if="!visibleApproval.isMemoryWrite && visibleApproval.choices.includes('always')" size="small" secondary @click="handleApproval('always')">
+                                    {{ t('chat.approvalAlways') }}
+                                </NButton>
+                                <NButton v-if="visibleApproval.isMemoryWrite || visibleApproval.choices.includes('deny')" size="small" type="error" secondary @click="handleApproval('deny')">
+                                    {{ t('chat.approvalDeny') }}
+                                </NButton>
+                            </div>
+                        </div>
+                    </Transition>
+                </div>
                 <div v-if="store.contextStatuses.size > 0 || (store.typingText && store.contextStatuses.size === 0)" class="status-bar">
                     <div v-if="store.contextStatuses.size > 0" class="context-status-list">
                         <div v-for="[name, status] in store.contextStatuses" :key="name" class="context-status">
@@ -497,38 +691,6 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                             <span /><span /><span />
                         </span>
                         {{ store.typingText }}
-                    </div>
-                </div>
-                <div v-if="visibleApproval" class="approval-bar">
-                    <div class="approval-icon" aria-hidden="true">
-                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10" />
-                            <path d="m9 12 2 2 4-4" />
-                        </svg>
-                    </div>
-                    <div class="approval-content">
-                        <div class="approval-main">
-                            <div class="approval-kicker">{{ t('chat.approvalKicker') }}</div>
-                            <div class="approval-title">
-                                <span v-if="visibleApproval.agentName">@{{ visibleApproval.agentName }} · </span>{{ t('chat.approvalTitle') }}
-                            </div>
-                            <div class="approval-desc">{{ visibleApproval.description }}</div>
-                            <code class="approval-command">{{ visibleApproval.command }}</code>
-                        </div>
-                        <div class="approval-actions">
-                            <NButton v-if="visibleApproval.choices.includes('once')" size="small" type="primary" @click="handleApproval('once')">
-                                {{ t('chat.approvalAllowOnce') }}
-                            </NButton>
-                            <NButton v-if="visibleApproval.choices.includes('session')" size="small" secondary @click="handleApproval('session')">
-                                {{ t('chat.approvalAllowSession') }}
-                            </NButton>
-                            <NButton v-if="visibleApproval.choices.includes('always')" size="small" secondary @click="handleApproval('always')">
-                                {{ t('chat.approvalAlways') }}
-                            </NButton>
-                            <NButton v-if="visibleApproval.choices.includes('deny')" size="small" type="error" secondary @click="handleApproval('deny')">
-                                {{ t('chat.approvalDeny') }}
-                            </NButton>
-                        </div>
                     </div>
                 </div>
                 <GroupChatInput @send="handleSendMessage" />
@@ -679,10 +841,19 @@ export default defineComponent({ components: { CreateRoomForm } })
     height: 100%;
     overflow: hidden;
     position: relative;
+    min-width: 0;
+    max-width: 100%;
 }
 
 .sidebar-backdrop {
     display: none;
+}
+
+.group-message-shell {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    display: flex;
 }
 
 @media (max-width: $breakpoint-mobile) {
@@ -758,66 +929,68 @@ export default defineComponent({ components: { CreateRoomForm } })
     }
 }
 
-.approval-bar {
+.approval-float-panel {
+    position: absolute;
+    right: 16px;
+    bottom: 16px;
+    z-index: 8;
+    width: min(720px, calc(100% - 32px));
+    padding: 10px;
+    border: 1px solid rgba(var(--accent-primary-rgb), 0.24);
+    border-radius: 16px;
+    background: #ffffff;
+    box-shadow: 0 14px 40px rgba(0, 0, 0, 0.14);
+    backdrop-filter: blur(14px);
+
+    .dark & {
+        background: #262626;
+    }
+}
+
+.approval-float-header {
     display: flex;
-    align-items: flex-start;
-    gap: 10px;
-    margin: 0 16px 12px;
-    padding: 12px;
-    border: 1px solid $border-color;
-    border-radius: 8px;
-    background: $bg-card;
-    box-shadow: none;
-}
-
-.approval-icon {
-    display: grid;
-    place-items: center;
-    flex: 0 0 32px;
-    width: 32px;
-    height: 32px;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 4px 8px;
     color: var(--accent-primary);
-    background: rgba(var(--accent-primary-rgb), 0.12);
-    border: 1px solid rgba(var(--accent-primary-rgb), 0.2);
-    border-radius: 8px;
-}
-
-.approval-content {
-    flex: 1;
-    min-width: 0;
-}
-
-.approval-main {
-    min-width: 0;
-}
-
-.approval-kicker {
-    margin-bottom: 2px;
-    font-size: 10px;
+    font-size: 11px;
     font-weight: 700;
     line-height: 1.2;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-    color: var(--accent-primary);
 }
 
-.approval-title {
+.approval-float-icon {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--accent-primary);
+    background: rgba(var(--accent-primary-rgb), 0.12);
+    border: 1px solid rgba(var(--accent-primary-rgb), 0.24);
+}
+
+.approval-float-title {
+    padding: 0 4px;
     font-size: 14px;
     font-weight: 700;
     line-height: 1.3;
     color: $text-primary;
 }
 
-.approval-desc {
-    margin-top: 4px;
+.approval-float-desc {
+    padding: 0 4px;
+    margin-top: 5px;
     font-size: 12px;
     line-height: 1.45;
     color: $text-secondary;
 }
 
-.approval-command {
+.approval-float-command {
     display: block;
-    margin-top: 8px;
+    margin: 8px 4px 0;
     max-height: 96px;
     overflow: auto;
     white-space: pre-wrap;
@@ -826,52 +999,55 @@ export default defineComponent({ components: { CreateRoomForm } })
     font-size: 11px;
     line-height: 1.45;
     color: $text-primary;
-    background: $bg-secondary;
+    background: rgba(255, 255, 255, 0.68);
     border: 1px solid $border-color;
-    border-radius: 6px;
+    border-radius: 11px;
     padding: 8px 10px;
+
+    .dark & {
+        background: rgba(255, 255, 255, 0.08);
+    }
 }
 
-.approval-actions {
+.approval-float-actions {
     display: flex;
     flex-wrap: wrap;
-    justify-content: flex-end;
+    justify-content: flex-start;
     gap: 8px;
     margin-top: 10px;
-    padding-top: 10px;
+    padding: 10px 4px 0;
     border-top: 1px solid $border-color;
 }
 
-@media (max-width: 768px) {
-    .approval-bar {
-        margin: 0 10px 10px;
-        padding: 10px;
+@media (max-width: 640px) {
+    .approval-float-panel {
+        left: 8px;
+        right: 8px;
+        bottom: 8px;
+        width: auto;
+        padding: 7px;
+        border-radius: 14px;
     }
 
-    .approval-icon {
-        flex-basis: 28px;
-        width: 28px;
-        height: 28px;
-    }
-
-    .approval-actions {
+    .approval-float-actions {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
     }
 
-    .approval-actions :deep(.n-button) {
+    .approval-float-actions :deep(.n-button) {
         width: 100%;
     }
 }
 
-@media (max-width: 420px) {
-    .approval-bar {
-        gap: 8px;
-    }
+.approval-float-enter-active,
+.approval-float-leave-active {
+    transition: opacity 0.2s ease, transform 0.2s ease;
+}
 
-    .approval-actions {
-        grid-template-columns: 1fr;
-    }
+.approval-float-enter-from,
+.approval-float-leave-to {
+    opacity: 0;
+    transform: translateY(10px) scale(0.98);
 }
 
 .typing-indicator {
@@ -908,7 +1084,7 @@ export default defineComponent({ components: { CreateRoomForm } })
 // ─── Room Sidebar ────────────────────────────────────────
 
 .room-sidebar {
-    width: 220px;
+    width: $sidebar-width;
     flex-shrink: 0;
     border-right: 1px solid $border-color;
     display: flex;
@@ -916,21 +1092,80 @@ export default defineComponent({ components: { CreateRoomForm } })
 }
 
 .sidebar-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
     padding: 12px;
     flex-shrink: 0;
+}
 
-    .sidebar-title {
-        font-size: 15px;
-        font-weight: 600;
+.page-sidebar-tab {
+    width: 100%;
+    min-width: 0;
+    height: 34px;
+    border: none;
+    border-radius: $radius-sm;
+    background: transparent;
+    color: $text-secondary;
+    display: inline-flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 8px;
+    padding: 7px 10px;
+    cursor: pointer;
+    transition:
+        background-color $transition-fast,
+        color $transition-fast;
+
+    svg {
+        flex-shrink: 0;
+    }
+
+    span {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 13px;
+        line-height: 18px;
+    }
+
+    &:hover {
+        background: rgba(var(--accent-primary-rgb), 0.06);
+        color: $text-primary;
+    }
+}
+
+.conversation-switch {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 2px;
+    margin: 0 12px 8px;
+    padding: 2px;
+    border-radius: $radius-sm;
+    background: rgba(var(--accent-primary-rgb), 0.05);
+    flex-shrink: 0;
+}
+
+.conversation-switch-tab {
+    min-width: 0;
+    height: 28px;
+    border: none;
+    border-radius: 5px;
+    background: transparent;
+    color: $text-secondary;
+    font-size: 12px;
+    line-height: 16px;
+    cursor: pointer;
+    transition:
+        background-color $transition-fast,
+        color $transition-fast;
+
+    &:hover {
         color: $text-primary;
     }
 
-    .sidebar-actions {
-        display: flex;
-        gap: 4px;
+    &.active {
+        background: $bg-card;
+        color: $text-primary;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
     }
 }
 
@@ -1024,6 +1259,262 @@ export default defineComponent({ components: { CreateRoomForm } })
     text-align: center;
     font-size: 13px;
     color: $text-muted;
+}
+
+.page-sidebar-bottom {
+    flex-shrink: 0;
+    padding: 10px 12px;
+}
+
+.page-sidebar-menu-btn {
+    width: 100%;
+    min-width: 0;
+    height: 36px;
+    border: none;
+    border-radius: $radius-sm;
+    background: transparent;
+    color: $text-secondary;
+    display: inline-flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 8px;
+    padding: 8px 10px;
+    cursor: pointer;
+    transition:
+        background-color $transition-fast,
+        color $transition-fast;
+
+    &:hover {
+        background: rgba(var(--accent-primary-rgb), 0.06);
+        color: $text-primary;
+    }
+
+    span {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 13px;
+        line-height: 18px;
+    }
+}
+
+.page-sidebar-popover {
+    width: $sidebar-width;
+    padding: 12px;
+    border: 1px solid $border-color;
+    border-radius: $radius-md;
+    background: $bg-card;
+    box-shadow: 0 12px 34px rgba(0, 0, 0, 0.18);
+}
+
+.page-sidebar-popover :deep(.profile-selector),
+.page-sidebar-popover :deep(.model-selector) {
+    padding: 0;
+}
+
+.page-sidebar-popover :deep(.model-selector) {
+    margin-bottom: 10px;
+}
+
+.page-sidebar-popover :deep(.language-switch) {
+    width: 88px;
+    flex: 0 0 88px;
+}
+
+.page-sidebar-popover :deep(.language-switch .n-base-selection-input__content) {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.page-sidebar-popover-row,
+.page-sidebar-version-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 0;
+    border-top: 1px solid $border-color;
+}
+
+.status-indicator {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    font-size: 12px;
+    color: $text-secondary;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.status-indicator.connected .status-dot {
+    background-color: $success;
+    box-shadow: 0 0 6px rgba(var(--success-rgb), 0.5);
+}
+
+.status-indicator.disconnected .status-dot {
+    background-color: $error;
+}
+
+.status-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.page-sidebar-version-row {
+    gap: 6px;
+}
+
+.page-sidebar-version-links {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    gap: 6px;
+}
+
+.page-sidebar-link {
+    color: $text-muted;
+    display: flex;
+    align-items: center;
+    transition: color $transition-fast;
+
+    &:hover {
+        color: $text-primary;
+    }
+}
+
+.page-sidebar-version-text {
+    flex: 0 0 auto;
+    color: $text-muted;
+    font-size: 11px;
+    line-height: 16px;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: color $transition-fast;
+
+    &:hover {
+        color: $accent-primary;
+    }
+}
+
+.page-sidebar-version-row :deep(.theme-switch-container) {
+    flex-shrink: 0;
+}
+
+.page-sidebar-nav-btn,
+.page-sidebar-logout-btn {
+    width: 100%;
+    min-width: 0;
+    height: 36px;
+    border: none;
+    border-top: 1px solid $border-color;
+    border-radius: 0;
+    background: transparent;
+    color: $text-secondary;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 0;
+    cursor: pointer;
+    transition: color $transition-fast;
+
+    span {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 13px;
+        line-height: 18px;
+    }
+}
+
+.page-sidebar-nav-btn:hover {
+    color: $text-primary;
+}
+
+.page-sidebar-logout-btn {
+    margin-bottom: 6px;
+
+    &:hover {
+        color: $error;
+    }
+}
+
+.page-sidebar-logout-user {
+    margin-left: auto;
+    min-width: 0;
+    max-width: 112px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: $text-muted;
+    font-size: 12px;
+}
+
+.changelog-list {
+    max-height: min(70vh, 640px);
+    overflow-y: auto;
+}
+
+.changelog-version-block {
+    margin-bottom: 20px;
+
+    &:last-child {
+        margin-bottom: 0;
+    }
+}
+
+.changelog-version-header {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 8px;
+}
+
+.changelog-version-tag {
+    font-weight: 600;
+    font-size: 14px;
+    color: $text-primary;
+    font-family: $font-code;
+}
+
+.changelog-date {
+    font-size: 12px;
+    color: $text-muted;
+}
+
+.changelog-changes {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+
+    li {
+        font-size: 13px;
+        color: $text-secondary;
+        padding: 4px 0 4px 16px;
+        position: relative;
+
+        &::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 12px;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: $text-muted;
+        }
+    }
 }
 
 // ─── Chat Main ──────────────────────────────────────────
@@ -1331,6 +1822,19 @@ export default defineComponent({ components: { CreateRoomForm } })
 
     .chat-header {
         padding: 16px 12px 16px 52px;
+    }
+
+    .header-sidebar-toggle {
+        display: none;
+    }
+
+    .page-sidebar-popover {
+        width: min($sidebar-width, calc(100vw - 24px));
+    }
+
+    .page-sidebar-popover :deep(.language-switch) {
+        width: 86px;
+        flex-basis: 86px;
     }
 }
 </style>
