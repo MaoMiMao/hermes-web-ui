@@ -1,14 +1,14 @@
 # ============================================================
 # Stage 1: Builder — install build tools, compile everything
 # ============================================================
-ARG BASE_IMAGE=nousresearch/hermes-agent:v2026.5.29.2
+ARG BASE_IMAGE=nousresearch/hermes-agent:latest
 FROM ${BASE_IMAGE} AS builder
 
 ARG NODE_VERSION=24.15.0
 USER root
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl make g++ \
+    ca-certificates ffmpeg curl make g++ \
     && rm -rf /var/lib/apt/lists/*
 
 # Install mcp2cli into the venv (pip bootstrap → install → cleanup caches)
@@ -17,6 +17,13 @@ RUN curl -fsSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py \
     && rm /tmp/get-pip.py \
     && /opt/hermes/.venv/bin/pip3 install --no-cache-dir mcp2cli \
     && rm -rf /root/.cache/pip /tmp/get-pip.py /root/.local
+
+# Pre-install offline Python deps for bundled Hermes Agent skills into the venv,
+# so the runtime image (which copies this venv) works without network access.
+COPY docker/requirements-offline.txt /tmp/requirements-offline.txt
+RUN /opt/hermes/.venv/bin/pip3 install --no-cache-dir -r /tmp/requirements-offline.txt \
+    && rm -f /tmp/requirements-offline.txt \
+    && rm -rf /root/.cache/pip
 
 # Override Node.js version if needed
 RUN ARCH=$(dpkg --print-architecture) \

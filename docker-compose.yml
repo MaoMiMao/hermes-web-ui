@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ${WEBUI_IMAGE:-hermes-web-ui-local:20260601}
+    image: ${WEBUI_IMAGE:-hermes-web-ui-local:20260624}
     container_name: ${WEBUI_CONTAINER_NAME:-hermes-webui}
     ports:
       - "${PORT:-6060}:${PORT:-6060}"
