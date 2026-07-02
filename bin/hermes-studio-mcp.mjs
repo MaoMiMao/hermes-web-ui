@@ -434,7 +434,7 @@ const moduleHints = {
     keywords: ['provider', 'model provider', 'api key', 'base url'],
   },
   Sessions: {
-    purpose: 'List, inspect, create, update, and delete chat sessions.',
+    purpose: 'List, inspect, create, update, and delete user-requested chat sessions. Do not use session operations as an internal delegation mechanism.',
     keywords: ['sessions', 'conversation', 'chat history'],
   },
   Skills: {
@@ -731,7 +731,7 @@ const tools = [
   {
     name: 'hermes_studio_api_request',
     toolset: 'api',
-    description: 'Execute a Hermes Studio operation by calling an endpoint path. Use hermes_studio_api_openapi_get first as the operation manual to inspect method, parameters, requestBody, and responses.',
+    description: 'Execute a Hermes Studio operation by calling an endpoint path. Use hermes_studio_api_openapi_get first as the operation manual to inspect method, parameters, requestBody, and responses. Do not use /api/chat-run/* or /api/hermes/sessions/* as an internal delegation mechanism.',
     inputSchema: inputSchema({
         method: {
           type: 'string',
@@ -763,7 +763,7 @@ const tools = [
   {
     name: 'hermes_studio_use_chat_run',
     toolset: 'use',
-    description: 'Start one Hermes Studio chat or coding-agent run through the HTTP bridge and wait for completion.',
+    description: 'Start one user-requested Hermes Studio chat or coding-agent run through the HTTP bridge and wait for completion. Do not use this as an internal delegation or subtask mechanism.',
     inputSchema: inputSchema({
         input: {
           oneOf: [
@@ -852,7 +852,7 @@ const tools = [
   {
     name: 'hermes_studio_use_sessions_list',
     toolset: 'use',
-    description: 'List Hermes Studio chat sessions.',
+    description: 'List Hermes Studio chat sessions for an explicit user-requested session operation. Do not use this as an internal delegation mechanism.',
     inputSchema: inputSchema({
         limit: {
           type: 'number',
@@ -867,7 +867,7 @@ const tools = [
   {
     name: 'hermes_studio_use_sessions_count',
     toolset: 'use',
-    description: 'Count Hermes Studio chat sessions without returning the session list.',
+    description: 'Count Hermes Studio chat sessions without returning the session list. Do not use this as an internal delegation mechanism.',
     inputSchema: inputSchema({
         source: {
           type: 'string',
@@ -889,7 +889,7 @@ const tools = [
   {
     name: 'hermes_studio_use_session_get',
     toolset: 'use',
-    description: 'Get one Hermes Studio session by id.',
+    description: 'Get one Hermes Studio session by id for an explicit user-requested session operation. Do not use this as an internal delegation mechanism.',
     inputSchema: inputSchema({
         session_id: {
           type: 'string',
@@ -900,7 +900,7 @@ const tools = [
   {
     name: 'hermes_studio_use_session_messages',
     toolset: 'use',
-    description: 'Get messages for one Hermes Studio conversation. By default returns user and assistant messages only.',
+    description: 'Get messages for one Hermes Studio conversation. By default returns user and assistant messages only. Do not use this as an internal delegation mechanism.',
     inputSchema: inputSchema({
         session_id: {
           type: 'string',
@@ -915,7 +915,7 @@ const tools = [
   {
     name: 'hermes_studio_use_session_context',
     toolset: 'use',
-    description: 'Get the latest clean user/assistant context for one session, defaulting to the last 10 conversation turns and excluding tool calls/tool results.',
+    description: 'Get the latest clean user/assistant context for one session, defaulting to the last 10 conversation turns and excluding tool calls/tool results. Do not use this as an internal delegation mechanism.',
     inputSchema: inputSchema({
         session_id: {
           type: 'string',
@@ -930,7 +930,7 @@ const tools = [
   {
     name: 'hermes_studio_use_session_delete',
     toolset: 'use',
-    description: 'Delete one Hermes Studio session by id.',
+    description: 'Delete one Hermes Studio session by id for an explicit user-requested session operation. Do not use this as an internal delegation mechanism.',
     inputSchema: inputSchema({
         session_id: {
           type: 'string',
@@ -941,7 +941,7 @@ const tools = [
   {
     name: 'hermes_studio_use_session_rename',
     toolset: 'use',
-    description: 'Rename one Hermes Studio session title.',
+    description: 'Rename one Hermes Studio session title for an explicit user-requested session operation. Do not use this as an internal delegation mechanism.',
     inputSchema: inputSchema({
         session_id: {
           type: 'string',
@@ -1037,6 +1037,203 @@ const tools = [
     toolset: 'use',
     description: 'Summarize current Hermes worker state, including worker count, completed interactions, and sessions still interacting.',
     inputSchema: inputSchema(),
+  },
+  {
+    name: 'hermes_studio_use_workflows_list',
+    toolset: 'use',
+    description: 'List Hermes Studio workflows for the selected or requested profile.',
+    inputSchema: inputSchema({
+        profile: {
+          type: 'string',
+          description: 'Optional profile filter. When omitted, the active MCP profile is used through X-Hermes-Profile.',
+        },
+      }),
+  },
+  {
+    name: 'hermes_studio_use_workflow_get',
+    toolset: 'use',
+    description: 'Get one Hermes Studio workflow by id.',
+    inputSchema: inputSchema({
+        workflow_id: {
+          type: 'string',
+          description: 'Workflow id.',
+        },
+      }, ['workflow_id']),
+  },
+  {
+    name: 'hermes_studio_use_workflow_create',
+    toolset: 'use',
+    description: 'Create a Hermes Studio workflow with optional nodes, edges, viewport, workspace, and profile.',
+    inputSchema: inputSchema({
+        name: {
+          type: 'string',
+          description: 'Workflow name.',
+        },
+        profile: {
+          type: 'string',
+          description: 'Optional workflow profile. Defaults to the active MCP profile or server default.',
+        },
+        workspace: {
+          type: ['string', 'null'],
+          description: 'Optional workflow workspace path.',
+        },
+        nodes: {
+          type: 'array',
+          description: 'Optional workflow node array.',
+          items: { type: 'object', additionalProperties: true },
+        },
+        edges: {
+          type: 'array',
+          description: 'Optional workflow edge array.',
+          items: { type: 'object', additionalProperties: true },
+        },
+        viewport: {
+          type: ['object', 'null'],
+          description: 'Optional workflow viewport state.',
+          additionalProperties: true,
+        },
+      }, ['name']),
+  },
+  {
+    name: 'hermes_studio_use_workflow_update',
+    toolset: 'use',
+    description: 'Update a Hermes Studio workflow name, workspace, nodes, edges, or viewport.',
+    inputSchema: inputSchema({
+        workflow_id: {
+          type: 'string',
+          description: 'Workflow id.',
+        },
+        name: {
+          type: 'string',
+          description: 'Optional new workflow name.',
+        },
+        workspace: {
+          type: ['string', 'null'],
+          description: 'Optional workspace path update.',
+        },
+        nodes: {
+          type: 'array',
+          description: 'Optional replacement workflow node array.',
+          items: { type: 'object', additionalProperties: true },
+        },
+        edges: {
+          type: 'array',
+          description: 'Optional replacement workflow edge array.',
+          items: { type: 'object', additionalProperties: true },
+        },
+        viewport: {
+          type: ['object', 'null'],
+          description: 'Optional replacement workflow viewport state.',
+          additionalProperties: true,
+        },
+      }, ['workflow_id']),
+  },
+  {
+    name: 'hermes_studio_use_workflow_delete',
+    toolset: 'use',
+    description: 'Delete one Hermes Studio workflow by id, including its workflow run records.',
+    inputSchema: inputSchema({
+        workflow_id: {
+          type: 'string',
+          description: 'Workflow id to delete.',
+        },
+      }, ['workflow_id']),
+  },
+  {
+    name: 'hermes_studio_use_workflow_runs_list',
+    toolset: 'use',
+    description: 'List recent run records and node sessions for one workflow.',
+    inputSchema: inputSchema({
+        workflow_id: {
+          type: 'string',
+          description: 'Workflow id.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Optional maximum number of workflow runs.',
+        },
+      }, ['workflow_id']),
+  },
+  {
+    name: 'hermes_studio_use_workflow_run_start',
+    toolset: 'use',
+    description: 'Start a workflow run. Returns accepted status while the workflow continues asynchronously.',
+    inputSchema: inputSchema({
+        workflow_id: {
+          type: 'string',
+          description: 'Workflow id.',
+        },
+        start_node_ids: {
+          type: 'array',
+          description: 'Optional node ids to start from.',
+          items: { type: 'string' },
+        },
+        input: {
+          type: ['string', 'null'],
+          description: 'Optional workflow input text.',
+        },
+        timeout_ms: {
+          type: 'number',
+          description: 'Optional per-node run timeout in milliseconds.',
+        },
+      }, ['workflow_id']),
+  },
+  {
+    name: 'hermes_studio_use_workflow_run_stop',
+    toolset: 'use',
+    description: 'Cancel a queued or running workflow run.',
+    inputSchema: inputSchema({
+        workflow_id: {
+          type: 'string',
+          description: 'Workflow id.',
+        },
+        run_id: {
+          type: 'string',
+          description: 'Workflow run id.',
+        },
+      }, ['workflow_id', 'run_id']),
+  },
+  {
+    name: 'hermes_studio_use_workflow_run_rerun_from_node',
+    toolset: 'use',
+    description: 'Rerun an existing workflow run from a node. Use preserve_start_node=true to keep the selected node message and only rerun downstream nodes; false clears the selected node and downstream sessions.',
+    inputSchema: inputSchema({
+        workflow_id: {
+          type: 'string',
+          description: 'Workflow id.',
+        },
+        run_id: {
+          type: 'string',
+          description: 'Workflow run id.',
+        },
+        node_id: {
+          type: 'string',
+          description: 'Node id to rerun from.',
+        },
+        preserve_start_node: {
+          type: 'boolean',
+          description: 'When true, keep the selected node session and rerun downstream nodes only. Defaults to false on the server.',
+        },
+        timeout_ms: {
+          type: 'number',
+          description: 'Optional per-node run timeout in milliseconds.',
+        },
+      }, ['workflow_id', 'run_id', 'node_id']),
+  },
+  {
+    name: 'hermes_studio_use_workflow_run_delete',
+    toolset: 'use',
+    description: 'Delete one workflow run and its node session records.',
+    inputSchema: inputSchema({
+        workflow_id: {
+          type: 'string',
+          description: 'Workflow id.',
+        },
+        run_id: {
+          type: 'string',
+          description: 'Workflow run id.',
+        },
+      }, ['workflow_id', 'run_id']),
   },
   {
     name: 'hermes_studio_lan_devices_list',
@@ -1303,6 +1500,69 @@ async function callTool(name, args = {}) {
       return jsonText(summarizeWorkerRuntime(
         await request('/api/hermes/performance/runtime', withAuthArgs(args)),
       ))
+    case 'hermes_studio_use_workflows_list':
+      return jsonText(await request('/api/hermes/workflows', withAuthArgs(args, {
+        query: pickDefined(args, ['profile']),
+      })))
+    case 'hermes_studio_use_workflow_get':
+      return jsonText(await request(`/api/hermes/workflows/${encodeURIComponent(args.workflow_id)}`, withAuthArgs(args)))
+    case 'hermes_studio_use_workflow_create':
+      return jsonText(await request('/api/hermes/workflows', withAuthArgs(args, {
+        method: 'POST',
+        body: pickDefined(args, [
+          'name',
+          'profile',
+          'workspace',
+          'nodes',
+          'edges',
+          'viewport',
+        ]),
+      })))
+    case 'hermes_studio_use_workflow_update':
+      return jsonText(await request(`/api/hermes/workflows/${encodeURIComponent(args.workflow_id)}`, withAuthArgs(args, {
+        method: 'PATCH',
+        body: pickDefined(args, [
+          'name',
+          'workspace',
+          'nodes',
+          'edges',
+          'viewport',
+        ]),
+      })))
+    case 'hermes_studio_use_workflow_delete':
+      return jsonText(await request(`/api/hermes/workflows/${encodeURIComponent(args.workflow_id)}`, withAuthArgs(args, {
+        method: 'DELETE',
+      })))
+    case 'hermes_studio_use_workflow_runs_list':
+      return jsonText(await request(`/api/hermes/workflows/${encodeURIComponent(args.workflow_id)}/runs`, withAuthArgs(args, {
+        query: pickDefined(args, ['limit']),
+      })))
+    case 'hermes_studio_use_workflow_run_start':
+      return jsonText(await request(`/api/hermes/workflows/${encodeURIComponent(args.workflow_id)}/run`, withAuthArgs(args, {
+        method: 'POST',
+        body: pickDefined(args, [
+          'start_node_ids',
+          'input',
+          'timeout_ms',
+        ]),
+      })))
+    case 'hermes_studio_use_workflow_run_stop':
+      return jsonText(await request(`/api/hermes/workflows/${encodeURIComponent(args.workflow_id)}/runs/${encodeURIComponent(args.run_id)}/stop`, withAuthArgs(args, {
+        method: 'POST',
+      })))
+    case 'hermes_studio_use_workflow_run_rerun_from_node':
+      return jsonText(await request(`/api/hermes/workflows/${encodeURIComponent(args.workflow_id)}/runs/${encodeURIComponent(args.run_id)}/rerun-from-node`, withAuthArgs(args, {
+        method: 'POST',
+        body: pickDefined(args, [
+          'node_id',
+          'preserve_start_node',
+          'timeout_ms',
+        ]),
+      })))
+    case 'hermes_studio_use_workflow_run_delete':
+      return jsonText(await request(`/api/hermes/workflows/${encodeURIComponent(args.workflow_id)}/runs/${encodeURIComponent(args.run_id)}`, withAuthArgs(args, {
+        method: 'DELETE',
+      })))
     case 'hermes_studio_lan_devices_list':
       return jsonText(await request('/api/devices', withAuthArgs(args)))
     case 'hermes_studio_lan_devices_scan':

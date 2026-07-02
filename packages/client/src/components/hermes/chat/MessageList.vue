@@ -76,16 +76,16 @@ const formattedThinkingElapsed = computed(() => formatElapsed(thinkingElapsedMs.
 
 const currentToolCalls = computed(() => {
   const msgs = chatStore.messages;
-  // Find the last user message index
-  let lastUserIdx = -1;
+  // Slash commands are also user input boundaries for the live tool strip.
+  let lastInputIdx = -1;
   for (let i = msgs.length - 1; i >= 0; i--) {
-    if (msgs[i].role === "user") {
-      lastUserIdx = i;
+    if (msgs[i].role === "user" || msgs[i].role === "command") {
+      lastInputIdx = i;
       break;
     }
   }
-  // Only tool calls after the last user message, newest on top
-  const tools = msgs.filter((m, i) => m.role === "tool" && i > lastUserIdx);
+  // Only tool calls after the last user input, newest on top.
+  const tools = msgs.filter((m, i) => m.role === "tool" && i > lastInputIdx);
   return [...tools].reverse();
 });
 

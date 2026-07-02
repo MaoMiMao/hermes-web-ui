@@ -149,6 +149,15 @@ function openVersionManagement() {
             </svg>
             <span>{{ t("sidebar.mcp") }}</span>
           </RouteLinkItem>
+          <RouteLinkItem class="nav-item" :to="{ name: 'hermes.petdex' }" :active="selectedKey === 'hermes.petdex'">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 3l7 4v6c0 4-3 7-7 8-4-1-7-4-7-8V7l7-4z" />
+              <path d="M9 11h.01" />
+              <path d="M15 11h.01" />
+              <path d="M9.5 15c1.6 1.1 3.4 1.1 5 0" />
+            </svg>
+            <span>{{ t("sidebar.petdex") }}</span>
+          </RouteLinkItem>
           <RouteLinkItem class="nav-item" :to="{ name: 'hermes.memory' }" :active="selectedKey === 'hermes.memory'">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
               <path d="M9 18h6" />
@@ -245,7 +254,7 @@ function openVersionManagement() {
             </svg>
             <span>{{ t("sidebar.versionPreview") }}</span>
           </RouteLinkItem>
-          <RouteLinkItem class="nav-item" :to="{ name: 'hermes.devices' }" :active="selectedKey === 'hermes.devices'">
+          <RouteLinkItem v-if="isSuperAdmin" class="nav-item" :to="{ name: 'hermes.devices' }" :active="selectedKey === 'hermes.devices'">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
               <rect x="3" y="4" width="18" height="12" rx="2" />
               <path d="M8 20h8" />
@@ -814,6 +823,7 @@ function openVersionManagement() {
     z-index: 1000;
     transform: translateX(-100%);
     transition: transform $transition-normal;
+    padding-top: env(safe-area-inset-top, 0px);
 
     &.open {
       transform: translateX(0);

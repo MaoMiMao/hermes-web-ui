@@ -25,7 +25,7 @@ import { contentBlocksToString } from './content-blocks'
 import type { ContentBlock, QueuedRun, SessionState } from './types'
 import { authenticateUserToken, isAuthEnabled, type AuthenticatedUser } from '../../../middleware/user-auth'
 import { userCanAccessProfile } from '../../../db/hermes/users-store'
-import { ensureHermesRunWorkspace } from './workspace'
+import { observeRunChatPetEvent } from '../pet-state-socket'
 
 export type { ContentBlock } from './types'
 
@@ -195,6 +195,7 @@ export class ChatRunSocket {
       apiMode?: string
       api_mode?: string
       profile?: string
+      allow_command_passthrough?: boolean
       // Local patch (reasoning-effort): per-session reasoning effort override.
       reasoning_effort?: string
     }) => {
@@ -215,7 +216,7 @@ export class ChatRunSocket {
         const command = parseSessionCommand(data.input)
         if (command && (isBridgeRunSource(source) || command.name === 'branch')) {
           try {
-            await handleSessionCommand(data.session_id, command, {
+            const handled = await handleSessionCommand(data.session_id, command, {
               nsp: this.nsp,
               socket,
               sessionMap: this.sessionMap,
@@ -228,6 +229,8 @@ export class ChatRunSocket {
               queueId: data.queue_id,
               runQueuedItem: this.runQueuedItem.bind(this),
             })
+            if (handled !== false) return
+            data.allow_command_passthrough = true
           } catch (err) {
             this.emitToSession(socket, data.session_id, 'session.command', {
               event: 'session.command',
@@ -261,6 +264,7 @@ export class ChatRunSocket {
             api_key: data.api_key,
             apiMode: data.apiMode,
             api_mode: data.api_mode,
+            commandPassthrough: data.allow_command_passthrough,
             originSocketId: socket.id,
           })
           this.nsp.to(`session:${data.session_id}`).emit('run.queued', {
@@ -395,13 +399,15 @@ export class ChatRunSocket {
       api_key?: string
       apiMode?: string
       api_mode?: string
+      one_shot_model?: boolean
+      allow_command_passthrough?: boolean
       onEvent?: (event: string, payload: any) => void
     },
     profile: string,
     skipUserMessage = false,
   ) {
     const source = resolveRunSource(data.source, data.session_id)
-    if (data.session_id && isBridgeRunSource(source) && isSessionCommand(data.input)) return
+    if (data.session_id && isBridgeRunSource(source) && isSessionCommand(data.input) && data.allow_command_passthrough !== true) return
 
     if (!isCodingAgentExecution(source, data)) {
       const bridgeReady = await ensureBridgeReadyForChatRun()
@@ -446,14 +452,6 @@ export class ChatRunSocket {
       let fullInstructions = data.instructions
         ? `${getSystemPrompt(undefined, { source })}\n${data.instructions}`
         : getSystemPrompt(undefined, { source })
-      if (data.session_id) {
-        const sessionRow = getSession(data.session_id)
-        const workspace = await ensureHermesRunWorkspace(profile, sessionRow?.workspace || data.workspace)
-        if (workspace) {
-          const workspaceCtx = `[Current working directory: ${workspace}]`
-          fullInstructions = `\n${workspaceCtx}\n${fullInstructions}`
-        }
-      }
 
       await handleBridgeRun(
         this.nsp, socket, { ...data, instructions: fullInstructions }, profile,
@@ -546,6 +544,7 @@ export class ChatRunSocket {
           instructions,
           model: session?.model,
           provider: session?.provider,
+          workspace: session?.workspace,
           source,
         },
         this.sessionMap,
@@ -583,11 +582,7 @@ export class ChatRunSocket {
 
   private resumeInstructionsForSession(sessionId: string): string {
     const sessionRow = getSession(sessionId)
-    let fullInstructions = getSystemPrompt(undefined, { source: sessionRow?.source })
-    if (sessionRow?.workspace) {
-      fullInstructions = `\n[Current working directory: ${sessionRow.workspace}]\n${fullInstructions}`
-    }
-    return fullInstructions
+    return getSystemPrompt(undefined, { source: sessionRow?.source })
   }
 
   // --- Queue ---
@@ -638,6 +633,8 @@ export class ChatRunSocket {
       api_key: next.api_key,
       apiMode: next.apiMode,
       api_mode: next.api_mode,
+      one_shot_model: next.oneShotModel,
+      allow_command_passthrough: next.commandPassthrough,
     }, next.profile || fallbackProfile, skipUserMessage)
   }
 
@@ -820,6 +817,8 @@ export class ChatRunSocket {
 
   emitExternalEvent(sessionId: string, event: string, payload: any) {
     const tagged = { ...payload, session_id: sessionId }
+    const profile = this.resolvePetEventProfile(sessionId, tagged)
+    this.observePetEvent(profile, event, tagged)
     const state = this.sessionMap.get(sessionId)
     if (state?.isWorking) {
       state.events.push({ event, data: tagged })
@@ -952,6 +951,8 @@ export class ChatRunSocket {
 
   private emitToSession(socket: Socket, sessionId: string, event: string, payload: any) {
     const tagged = { ...payload, session_id: sessionId }
+    const profile = this.resolvePetEventProfile(sessionId, tagged)
+    this.observePetEvent(profile, event, tagged)
     this.nsp.to(`session:${sessionId}`).emit(event, tagged)
     if (!this.nsp.adapter.rooms.get(`session:${sessionId}`)?.size && socket.connected) {
       socket.emit(event, tagged)
@@ -985,5 +986,22 @@ export class ChatRunSocket {
     }
     this.sessionMap.clear()
     logger.info('[chat-run-socket] closed all connections and cleared state')
+  }
+
+  private resolvePetEventProfile(sessionId: string, payload: Record<string, unknown>): string {
+    const payloadProfile = typeof payload.profile === 'string' ? payload.profile.trim() : ''
+    if (payloadProfile) return payloadProfile
+    const stateProfile = this.sessionMap.get(sessionId)?.profile
+    if (stateProfile) return stateProfile
+    const storedProfile = getSession(sessionId)?.profile
+    return storedProfile || 'default'
+  }
+
+  private observePetEvent(profile: string, event: string, payload: Record<string, unknown>): void {
+    try {
+      observeRunChatPetEvent(profile, event, payload)
+    } catch (err) {
+      logger.debug(err, '[chat-run-socket] failed to update pet state')
+    }
   }
 }

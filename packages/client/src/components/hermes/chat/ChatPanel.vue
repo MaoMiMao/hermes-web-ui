@@ -727,8 +727,13 @@ const contextMenuOptions = computed(() => {
     label: t(contextSessionPinned.value ? "chat.unpin" : "chat.pin"),
     key: "pin",
   },
-  { label: t("chat.rename"), key: "rename" },
-  { label: t("chat.setWorkspace"), key: "workspace" }]
+  { label: t("chat.rename"), key: "rename" }]
+
+  if (contextSession.value?.source !== "global_agent") {
+    options.push({ label: t("chat.archiveSession"), key: "archive" })
+  }
+
+  options.push({ label: t("chat.setWorkspace"), key: "workspace" })
 
   if (contextSession.value?.source === "cli" || contextSession.value?.source === "coding_agent") {
     options.push({ label: t("chat.setModel"), key: "model" })
@@ -799,6 +804,19 @@ async function handleContextMenuSelect(key: string) {
     copySessionId(contextSessionId.value);
   } else if (key === "open-link") {
     openSessionInNewTab(contextSessionId.value);
+  } else if (key === "archive") {
+    const archivedSession = contextSession.value;
+    const ok = await chatStore.archiveSession(contextSessionId.value);
+    if (ok) {
+      sessionBrowserPrefsStore.removePinned(contextSessionId.value);
+      if (archivedSession) {
+        selectedSessionKeys.value.delete(sessionSelectionKey(archivedSession));
+        selectedSessionKeys.value = new Set(selectedSessionKeys.value);
+      }
+      message.success(t("chat.sessionArchived"));
+    } else {
+      message.error(t("chat.archiveSessionFailed"));
+    }
   } else if (parseExportKey(key)) {
     const { mode, ext } = parseExportKey(key)!;
     const loadingMsg = mode === "compressed" ? message.loading(t("chat.exportCompressing"), { duration: 0 }) : null;
@@ -1537,7 +1555,7 @@ async function handleSessionModelCustomSubmit() {
               :disabled="!canConfirmNewChat"
               @click="confirmNewChat"
             >
-              {{ t("chat.newChat") }}
+              {{ t("common.create") }}
             </NButton>
           </div>
         </template>
@@ -1672,37 +1690,6 @@ async function handleSessionModelCustomSubmit() {
               </template>
               {{ t("chat.copySessionId") }}
             </NTooltip>
-            <NButton
-              class="header-model-button"
-              size="small"
-              :circle="isMobile"
-              :title="activeSessionModelLabel"
-              @click="handleHeaderModelClick"
-            >
-              <template #icon>
-                <svg
-                  width="14"
-                  height="14"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="1.8"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                >
-                  <circle cx="12" cy="12" r="3" />
-                  <path d="M12 1v4" />
-                  <path d="M12 19v4" />
-                  <path d="M1 12h4" />
-                  <path d="M19 12h4" />
-                  <path d="M4.22 4.22l2.83 2.83" />
-                  <path d="M16.95 16.95l2.83 2.83" />
-                  <path d="M4.22 19.78l2.83-2.83" />
-                  <path d="M16.95 7.05l2.83-2.83" />
-                </svg>
-              </template>
-              <template v-if="!isMobile">{{ activeSessionModelLabel }}</template>
-            </NButton>
           </template>
         </div>
       </header>
@@ -1719,7 +1706,11 @@ async function handleSessionModelCustomSubmit() {
         >
           <div class="chat-main-content">
             <MessageList ref="messageListRef" />
-            <ChatInput ref="chatInputRef" />
+            <ChatInput
+              ref="chatInputRef"
+              :model-label="activeSessionModelLabel"
+              @model-click="handleHeaderModelClick"
+            />
           </div>
           <OutlinePanel
             v-if="showOutline"
@@ -2360,6 +2351,18 @@ async function handleSessionModelCustomSubmit() {
   display: flex;
   flex-direction: column;
   min-width: 0;
+  background-color: $bg-card;
+  animation: chat-surface-fade-in 1.5s ease both;
+}
+
+@keyframes chat-surface-fade-in {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
 }
 
 .chat-header {
@@ -2407,17 +2410,6 @@ async function handleSessionModelCustomSubmit() {
   flex-shrink: 0;
 }
 
-.header-model-button {
-  max-width: 220px;
-}
-
-.header-model-button :deep(.n-button__content) {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 .chat-mode-toggle {
   display: flex;
   align-items: center;
@@ -2427,7 +2419,7 @@ async function handleSessionModelCustomSubmit() {
 
 @media (max-width: $breakpoint-mobile) {
   .chat-header {
-    padding: 16px 12px 16px 52px;
+    padding: calc(16px + env(safe-area-inset-top, 0px)) 12px 16px 52px;
   }
 
   .header-sidebar-toggle {

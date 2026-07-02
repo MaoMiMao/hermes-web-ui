@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
-import { NButton, NSpin, useMessage } from 'naive-ui'
+import { NButton, NSpin, NTabPane, NTabs, useMessage } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import AuxiliaryModelsPanel from '@/components/hermes/models/AuxiliaryModelsPanel.vue'
+import CombinationModelsPanel from '@/components/hermes/models/CombinationModelsPanel.vue'
 import ProvidersPanel from '@/components/hermes/models/ProvidersPanel.vue'
 import ProviderFormModal from '@/components/hermes/models/ProviderFormModal.vue'
 import { useModelsStore } from '@/stores/hermes/models'
@@ -14,6 +15,7 @@ const modelsStore = useModelsStore()
 const profilesStore = useProfilesStore()
 const message = useMessage()
 const showModal = ref(false)
+const activeTab = ref<'general' | 'auxiliary' | 'combination'>('general')
 
 async function loadProvidersForProfile() {
   if (!profilesStore.activeProfileName || profilesStore.profiles.length === 0) {
@@ -60,7 +62,7 @@ async function handleRefreshModelCache() {
 
     <header class="page-header">
       <h2 class="header-title">{{ t('models.title') }}</h2>
-      <div class="header-actions">
+      <div v-if="activeTab === 'general'" class="header-actions">
         <NButton
           size="small"
           :loading="modelsStore.refreshingModelCache"
@@ -82,10 +84,19 @@ async function handleRefreshModelCache() {
     </header>
 
     <div class="models-content">
-      <AuxiliaryModelsPanel />
-      <NSpin :show="modelsStore.loading && modelsStore.providers.length === 0">
-        <ProvidersPanel />
-      </NSpin>
+      <NTabs v-model:value="activeTab" type="line" animated>
+        <NTabPane name="general" :tab="t('models.generalTitle')">
+          <NSpin :show="modelsStore.loading && modelsStore.providers.length === 0">
+            <ProvidersPanel />
+          </NSpin>
+        </NTabPane>
+        <NTabPane name="auxiliary" :tab="t('models.auxiliaryTitle')">
+          <AuxiliaryModelsPanel />
+        </NTabPane>
+        <NTabPane name="combination" :tab="t('models.combinationTitle')">
+          <CombinationModelsPanel />
+        </NTabPane>
+      </NTabs>
     </div>
 
     <ProviderFormModal

@@ -642,17 +642,17 @@ async function uploadImages(files: File[]) {
 }
 
 .workflow-handle {
-  width: 12px;
-  height: 12px;
+  width: 16px;
+  height: 16px;
   border: 2px solid $bg-card;
   background: var(--accent-info);
 }
 
 .input-handle {
-  left: -7px;
+  left: -9px;
 }
 
 .output-handle {
-  right: -7px;
+  right: -9px;
 }
 </style>

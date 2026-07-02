@@ -50,6 +50,8 @@ export interface QueuedRun {
   api_key?: string
   apiMode?: string
   api_mode?: string
+  oneShotModel?: boolean
+  commandPassthrough?: boolean
   originSocketId?: string
   goalContinuation?: boolean
 }
@@ -107,6 +109,7 @@ export interface BridgeContextState {
   profile?: string
   model?: string
   provider?: string
+  workspace?: string
 }
 
 export type ChatRunSource = 'api_server' | 'cli' | 'coding_agent' | 'global_agent' | 'workflow'

@@ -481,7 +481,7 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                             <div class="avatar-stack-inner">
                                 <!-- User avatar first -->
                                 <span class="avatar-stack-item" :style="{ zIndex: store.agents.length + 1 }">
-                                    <ProfileAvatar class="agent-avatar" :name="store.userName || store.userId" :avatar="userMemberAvatar" :size="28" />
+                                    <ProfileAvatar class="agent-avatar" :name="store.userName || store.userId" :avatar="userMemberAvatar" :size="24" />
                                 </span>
                                 <span
                                     v-for="(agent, index) in store.agents.slice(-4)"
@@ -489,7 +489,7 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                                     class="avatar-stack-item"
                                     :style="{ zIndex: store.agents.length - index }"
                                 >
-                                    <ProfileAvatar class="agent-avatar" :name="agentAvatarName(agent)" :avatar="profileAvatarFor(agent.profile)" :size="28" />
+                                    <ProfileAvatar class="agent-avatar" :name="agentAvatarName(agent)" :avatar="profileAvatarFor(agent.profile)" :size="24" />
                                 </span>
                                 <span v-if="store.agents.length > 4" class="avatar-stack-more">+{{ store.agents.length - 4 }}</span>
                             </div>
@@ -518,7 +518,7 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                     <!-- Only user avatar, no agents -->
                     <div v-else-if="store.userName" class="avatar-stack-inner">
                         <span class="avatar-stack-item">
-                            <ProfileAvatar class="agent-avatar" :name="store.userName || store.userId" :avatar="userMemberAvatar" :size="28" />
+                            <ProfileAvatar class="agent-avatar" :name="store.userName || store.userId" :avatar="userMemberAvatar" :size="24" />
                         </span>
                     </div>
                     <button class="icon-btn" :title="t('groupChat.addAgent')" @click="handleAddAgent">
@@ -544,7 +544,7 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                 </div>
             </div>
 
-            <template v-if="hasRoom">
+            <div v-if="hasRoom" class="group-chat-surface">
                 <div class="group-message-shell">
                     <GroupMessageList />
                     <Transition name="approval-float">
@@ -611,7 +611,7 @@ async function handleApproval(choice: 'once' | 'session' | 'always' | 'deny') {
                     </div>
                 </div>
                 <GroupChatInput ref="groupChatInputRef" @send="handleSendMessage" />
-            </template>
+            </div>
 
             <div v-else class="no-room">
                 <div class="no-room-icon">
@@ -1231,6 +1231,26 @@ export default defineComponent({ components: { CreateRoomForm } })
     position: relative;
 }
 
+.group-chat-surface {
+    flex: 1;
+    min-height: 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    background-color: $bg-card;
+    animation: group-chat-surface-fade-in 1.5s ease both;
+}
+
+@keyframes group-chat-surface-fade-in {
+    from {
+        opacity: 0;
+    }
+
+    to {
+        opacity: 1;
+    }
+}
+
 .chat-main--drop-active::after {
     content: "";
     position: absolute;
@@ -1248,6 +1268,27 @@ export default defineComponent({ components: { CreateRoomForm } })
     gap: 12px;
     padding: 21px 20px;
     border-bottom: 1px solid $border-color;
+
+    .icon-btn {
+        width: 28px;
+        height: 28px;
+    }
+
+    .avatar-stack-item,
+    .avatar-stack-more {
+        width: 24px;
+        height: 24px;
+    }
+
+    .avatar-stack-item,
+    .avatar-stack-more,
+    .icon-btn {
+        box-sizing: content-box;
+    }
+
+    .avatar-stack-item {
+        margin-left: -10px;
+    }
 
     .room-title-text {
         font-size: 16px;
