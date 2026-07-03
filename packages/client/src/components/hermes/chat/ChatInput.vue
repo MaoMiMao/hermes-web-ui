@@ -1018,7 +1018,7 @@ function isImage(type: string): boolean {
       <div v-if="showContextUsage" class="context-usage-row">
         <span class="context-info" :class="{ 'context-warning': usagePercent > 80 }">
           {{ formatTokens(totalTokens) }} /
-          <NTooltip trigger="hover">
+          <NTooltip trigger="hover" :disabled="isMobileViewport">
             <template #trigger>
               <span class="context-limit-editable" @click="handleEditContextLimit">
                 {{ formatTokens(contextLength) }}
@@ -1055,7 +1055,7 @@ function isImage(type: string): boolean {
       <div class="input-toolbar">
         <!-- Bottom bar: attach + input settings + actions -->
         <div class="input-top-bar">
-          <NTooltip trigger="hover">
+          <NTooltip trigger="hover" :disabled="isMobileViewport">
             <template #trigger>
               <NButton quaternary size="tiny" @click="handleAttachClick" circle class="toolbar-icon-button">
                 <template #icon>
@@ -1073,7 +1073,7 @@ function isImage(type: string): boolean {
             trigger="click"
             @update:value="onReasoningEffortChange"
           >
-            <NTooltip trigger="hover">
+            <NTooltip trigger="hover" :disabled="isMobileViewport">
               <template #trigger>
                 <NButton
                   quaternary
@@ -1102,7 +1102,7 @@ function isImage(type: string): boolean {
             :show-arrow="true"
             @select="handleInputSettingsSelect"
           >
-            <NTooltip trigger="hover">
+            <NTooltip trigger="hover" :disabled="isMobileViewport">
               <template #trigger>
                 <NButton
                   quaternary
@@ -1124,13 +1124,13 @@ function isImage(type: string): boolean {
             </NTooltip>
           </NDropdown>
 
-          <NTooltip trigger="hover">
+          <NTooltip trigger="hover" :disabled="isMobileViewport">
             <template #trigger>
               <NButton
                 quaternary
                 size="tiny"
                 class="input-model-button"
-                :title="props.modelLabel || t('models.selectModel')"
+                :title="isMobileViewport ? undefined : props.modelLabel || t('models.selectModel')"
                 :aria-label="props.modelLabel || t('models.selectModel')"
                 @click="handleModelButtonClick"
               >
@@ -1740,7 +1740,7 @@ function isImage(type: string): boolean {
 
 .input-textarea {
   display: block;
-  flex: 1;
+  flex: 0 0 auto;
   width: 100%;
   background: none;
   border: none;
@@ -1779,6 +1779,7 @@ function isImage(type: string): boolean {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  margin-top: auto;
   min-height: 32px;
 }
 
