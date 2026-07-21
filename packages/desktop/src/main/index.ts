@@ -1,15 +1,32 @@
-import { app, BrowserWindow, Menu, Tray, shell, ipcMain, nativeImage, Notification, screen } from 'electron'
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  ipcMain,
+  Menu,
+  nativeImage,
+  Notification,
+  screen,
+  session,
+  shell,
+  systemPreferences,
+  Tray,
+  type MessageBoxOptions,
+  type OpenDialogOptions,
+} from 'electron'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { startWebUiServer, stopWebUiServer, getToken } from './webui-server'
-import { bundledNode, desktopIcon, desktopRuntimeVersion, desktopTrayTemplateIcon, desktopWindowsTrayIcon, hermesBinExists, hermesBin, webuiDir } from './paths'
+import { bundledNode, desktopIcon, desktopMacTrayIcon, desktopRuntimeVersion, desktopWindowsTrayIcon, hermesBinExists, hermesBin, runtimeStorageRoot, webuiDir } from './paths'
 import { checkForDesktopUpdates, initAutoUpdater } from './updater'
 import { t } from './desktop-i18n'
+import { resetDesktopDefaultLogin } from './desktop-login-reset'
 import { installHermesStudioCliShim, installHermesStudioMcpShim } from './cli-shim'
 import { parseHermesCliArgs, runBundledHermesCli } from './hermes-cli'
 import {
   ensureDesktopRuntime,
   isDesktopRuntimeReady,
+  migratePendingRuntimeRoot,
   writeActiveRuntimeVersion,
   type RuntimeDownloadSource,
   type RuntimeProgress,
@@ -33,7 +50,9 @@ let petWindowLoadPromise: Promise<void> | null = null
 let serverUrl: string | null = null
 let tray: Tray | null = null
 let isQuitting = false
+let appShutdownPromise: Promise<void> | null = null
 let isBootstrapping = false
+let isResettingLogin = false
 let windowFadeTimer: NodeJS.Timeout | null = null
 const activeNotifications = new Set<Notification>()
 
@@ -81,7 +100,7 @@ function showWindowWithFade(focus = true) {
 
 function showMainWindow() {
   if (!mainWindow) {
-    createWindow()
+    void createWindow()
   }
   if (!mainWindow) return
   showWindowWithFade(true)
@@ -90,6 +109,18 @@ function showMainWindow() {
 function quitApp() {
   isQuitting = true
   app.quit()
+}
+
+async function prepareAppShutdown(): Promise<void> {
+  isQuitting = true
+  if (!appShutdownPromise) {
+    appShutdownPromise = (async () => {
+      cancelWindowFade()
+      await showShutdownSplash()
+      await stopWebUiServer().catch(() => undefined)
+    })()
+  }
+  await appShutdownPromise
 }
 
 function defaultPetWindowBounds(): DesktopWindowBounds {
@@ -126,9 +157,18 @@ function sanitizePetWindowBounds(input: unknown): DesktopWindowBounds | null {
   }
 }
 
-function petRouteUrl(): string | null {
+function webUiHashUrl(hashPath: string): string | null {
   if (!serverUrl) return null
-  return `${serverUrl.replace(/#.*$/, '').replace(/\/$/, '')}/#/desktop-pet`
+  const normalizedHash = hashPath.startsWith('/') ? hashPath : `/${hashPath}`
+  return `${serverUrl.replace(/#.*$/, '').replace(/\/$/, '')}/#${normalizedHash}`
+}
+
+function mainRouteUrl(): string | null {
+  return webUiHashUrl('/hermes/chat')
+}
+
+function petRouteUrl(): string | null {
+  return webUiHashUrl('/desktop-pet')
 }
 
 function ensurePetWindow(): BrowserWindow {
@@ -241,6 +281,78 @@ function setOpenAtLogin(openAtLogin: boolean) {
   })
 }
 
+async function clearWebLoginSession() {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  await mainWindow.webContents.executeJavaScript(`
+    try {
+      localStorage.removeItem('hermes_api_key');
+      sessionStorage.clear();
+      window.location.hash = '#/login';
+    } catch {
+      window.location.hash = '#/login';
+    }
+  `).catch(() => undefined)
+}
+
+function showDesktopMessageBox(options: MessageBoxOptions) {
+  if (mainWindow && !mainWindow.isDestroyed()) return dialog.showMessageBox(mainWindow, options)
+  return dialog.showMessageBox(options)
+}
+
+async function handleResetDefaultLogin() {
+  if (isResettingLogin || (isBootstrapping && !serverUrl)) return
+
+  const choice = await showDesktopMessageBox({
+    type: 'warning',
+    buttons: [t('tray.resetLogin'), t('common.cancel')],
+    defaultId: 0,
+    cancelId: 1,
+    title: t('loginReset.confirmTitle'),
+    message: t('loginReset.confirmMessage'),
+    detail: t('loginReset.confirmDetail'),
+  })
+  if (choice.response !== 0) return
+
+  isResettingLogin = true
+  updateTrayMenu()
+  showMainWindow()
+
+  try {
+    await clearWebLoginSession()
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      await mainWindow.loadURL(splashHtml(t('loginReset.resetting')))
+    }
+    await stopWebUiServer()
+    serverUrl = null
+    const credentials = await resetDesktopDefaultLogin()
+    const url = await startWebUiServer(PORT)
+    serverUrl = url
+    if (mainWindow && !mainWindow.isDestroyed()) await mainWindow.loadURL(url)
+    await loadPetWindowRoute()
+    await clearWebLoginSession()
+    await showDesktopMessageBox({
+      type: 'info',
+      buttons: [t('common.ok')],
+      defaultId: 0,
+      title: t('loginReset.successTitle'),
+      message: t('loginReset.successMessage', credentials),
+    })
+  } catch (err) {
+    console.error('[desktop-login-reset] failed:', err)
+    await showDesktopMessageBox({
+      type: 'error',
+      buttons: [t('common.ok')],
+      defaultId: 0,
+      title: t('loginReset.failedTitle'),
+      message: t('loginReset.failedMessage'),
+      detail: err instanceof Error ? err.message : String(err),
+    })
+  } finally {
+    isResettingLogin = false
+    updateTrayMenu()
+  }
+}
+
 function updateTrayMenu() {
   if (!tray) return
   const isVisible = !!mainWindow && mainWindow.isVisible()
@@ -265,6 +377,15 @@ function updateTrayMenu() {
       },
     },
     {
+      label: isResettingLogin ? t('loginReset.resetting') : t('tray.resetLogin'),
+      enabled: !isResettingLogin && (!isBootstrapping || !!serverUrl),
+      click: () => {
+        handleResetDefaultLogin().catch(err => {
+          console.error('[tray] reset login failed:', err)
+        })
+      },
+    },
+    {
       label: t('tray.openAtLogin'),
       type: 'checkbox',
       checked: getOpenAtLogin(),
@@ -285,18 +406,18 @@ function updateTrayMenu() {
 function createTray() {
   if (tray) return
   const source = process.platform === 'darwin'
-    ? desktopTrayTemplateIcon()
+    ? desktopMacTrayIcon()
     : process.platform === 'win32'
       ? desktopWindowsTrayIcon()
       : desktopIcon()
-  const icon = nativeImage.createFromPath(source).resize({
-    width: process.platform === 'darwin' ? 18 : process.platform === 'win32' ? 24 : 16,
-    height: process.platform === 'darwin' ? 18 : process.platform === 'win32' ? 24 : 16,
-    quality: 'best',
-  })
-  if (process.platform === 'darwin') {
-    icon.setTemplateImage(true)
-  }
+  const sourceIcon = nativeImage.createFromPath(source)
+  const icon = process.platform === 'darwin'
+    ? sourceIcon
+    : sourceIcon.resize({
+        width: process.platform === 'win32' ? 24 : 16,
+        height: process.platform === 'win32' ? 24 : 16,
+        quality: 'best',
+      })
   tray = new Tray(icon)
   tray.setToolTip('Hermes Studio')
   tray.on('click', () => {
@@ -306,7 +427,7 @@ function createTray() {
   updateTrayMenu()
 }
 
-function createWindow() {
+async function createWindow(): Promise<void> {
   mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
@@ -363,11 +484,49 @@ function createWindow() {
   // macOS), go straight to it. Otherwise show a loading splash; bootstrap()
   // will swap in the real URL once the server is ready.
   if (serverUrl) {
-    mainWindow.loadURL(serverUrl)
+    await mainWindow.loadURL(mainRouteUrl() || serverUrl)
   } else {
-    mainWindow.loadURL(splashHtml(t('runtime.checking')))
+    await mainWindow.loadURL(splashHtml(t('runtime.checking')))
   }
   updateTrayMenu()
+}
+
+function installMicrophonePermissionHandler() {
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    const isMainRenderer = !!mainWindow
+      && !mainWindow.isDestroyed()
+      && webContents === mainWindow.webContents
+    if (permission !== 'media') {
+      callback(isMainRenderer)
+      return
+    }
+
+    const mediaTypes = ('mediaTypes' in details ? details.mediaTypes : undefined) ?? []
+    const requestsAudio = mediaTypes.length ? mediaTypes.includes('audio') : true
+
+    if (!isMainRenderer || !requestsAudio) {
+      callback(false)
+      return
+    }
+
+    if (process.platform !== 'darwin') {
+      callback(true)
+      return
+    }
+
+    const status = systemPreferences.getMediaAccessStatus('microphone')
+    if (status === 'granted') {
+      callback(true)
+      return
+    }
+    if (status === 'denied' || status === 'restricted') {
+      callback(false)
+      return
+    }
+    void systemPreferences.askForMediaAccess('microphone')
+      .then(granted => callback(granted))
+      .catch(() => callback(false))
+  })
 }
 
 function splashHtml(label = t('desktop.startingLocalServices')): string {
@@ -384,12 +543,14 @@ function splashHtml(label = t('desktop.startingLocalServices')): string {
   .detail{min-height:18px;font-size:12px;color:#7f7f7f}
   .progress{width:320px;height:6px;border-radius:999px;background:#2b2b2b;overflow:hidden}
   .bar{width:0;height:100%;background:#d8d8d8;transition:width .18s ease}
+  .bar.indeterminate{width:40%;animation:progress 1.2s ease-in-out infinite;transition:none}
+  @keyframes progress{0%{transform:translateX(-110%)}100%{transform:translateX(360%)}}
   h1{font-weight:500;margin:0;font-size:18px}
 </style></head><body><div class="wrap">
 <h1>Hermes Studio</h1>
 <div class="row"><div class="dot"></div><div class="dot"></div><div class="dot"></div></div>
 <div id="label" class="label">${startingLabel}</div>
-<div class="progress"><div id="bar" class="bar"></div></div>
+<div class="progress"><div id="bar" class="bar indeterminate"></div></div>
 <div id="detail" class="detail"></div>
 </div></body></html>`
   return 'data:text/html;charset=utf-8,' + encodeURIComponent(html)
@@ -522,7 +683,7 @@ function updateSplash(progress: RuntimeProgress) {
   if (!mainWindow || mainWindow.isDestroyed()) return
   const label = progress.message
   const percent = typeof progress.percent === 'number' ? Math.round(progress.percent) : null
-  let detail = ''
+  let detail = progress.detail || ''
   if (progress.receivedBytes && progress.totalBytes) {
     detail = `${formatBytes(progress.receivedBytes)} / ${formatBytes(progress.totalBytes)}`
     if (percent !== null) detail += ` (${percent}%)`
@@ -537,7 +698,10 @@ function updateSplash(progress: RuntimeProgress) {
       const bar = document.getElementById('bar');
       if (label) label.textContent = ${JSON.stringify(label)};
       if (detail) detail.textContent = ${JSON.stringify(detail)};
-      if (bar) bar.style.width = ${JSON.stringify(percent === null ? '100%' : `${percent}%`)};
+      if (bar) {
+        bar.classList.toggle('indeterminate', ${JSON.stringify(percent === null)});
+        bar.style.width = ${JSON.stringify(percent === null ? '' : `${percent}%`)};
+      }
     }
   `).catch(() => undefined)
 }
@@ -547,6 +711,7 @@ async function bootstrap(source?: RuntimeDownloadSource) {
   isBootstrapping = true
 
   try {
+    await migratePendingRuntimeRoot(updateSplash)
     const selectedSource = source || envRuntimeDownloadSource()
     const runtimeUrlOverride = !!process.env.HERMES_DESKTOP_RUNTIME_URL?.trim()
     const manifestOverride = !!process.env.HERMES_DESKTOP_RUNTIME_MANIFEST_URL?.trim()
@@ -584,7 +749,8 @@ async function bootstrap(source?: RuntimeDownloadSource) {
     updateSplash({ stage: 'resolve', message: t('desktop.startingLocalServices') })
     const url = await startWebUiServer(PORT)
     serverUrl = url
-    if (mainWindow) await mainWindow.loadURL(url)
+    updateTrayMenu()
+    if (mainWindow) await mainWindow.loadURL(mainRouteUrl() || url)
     await loadPetWindowRoute()
   } catch (err) {
     console.error('Failed to start Web UI server:', err)
@@ -602,6 +768,18 @@ async function bootstrap(source?: RuntimeDownloadSource) {
 }
 
 ipcMain.handle('hermes-desktop:get-token', () => getToken())
+ipcMain.handle('hermes-desktop:select-runtime-directory', async (_event, defaultPath?: unknown) => {
+  const options: OpenDialogOptions = {
+    properties: ['openDirectory'],
+    defaultPath: typeof defaultPath === 'string' && defaultPath.trim()
+      ? defaultPath.trim()
+      : runtimeStorageRoot(),
+  }
+  const result = mainWindow && !mainWindow.isDestroyed()
+    ? await dialog.showOpenDialog(mainWindow, options)
+    : await dialog.showOpenDialog(options)
+  return result.canceled ? null : result.filePaths[0] || null
+})
 ipcMain.handle('hermes-desktop:get-window-state', () => windowState())
 ipcMain.handle('hermes-desktop:window-control', (_event, action?: unknown) => {
   if (action !== 'minimize' && action !== 'toggle-maximize' && action !== 'close') return windowState()
@@ -678,7 +856,7 @@ ipcMain.handle('hermes-desktop:notify-completion', (_event, payload?: { title?: 
 })
 ipcMain.handle('hermes-desktop:retry-bootstrap', async (_event, source?: RuntimeDownloadSource) => {
   if (serverUrl) {
-    await mainWindow?.loadURL(serverUrl)
+    await mainWindow?.loadURL(mainRouteUrl() || serverUrl)
     return
   }
   const selectedSource = source === 'cf' || source === 'github' ? source : undefined
@@ -701,7 +879,7 @@ function runDesktopApp() {
     showMainWindow()
   })
 
-  app.whenReady().then(() => {
+  app.whenReady().then(async () => {
     if (QUIT_EXISTING) {
       quitApp()
       return
@@ -712,6 +890,7 @@ function runDesktopApp() {
     // visual clutter. macOS keeps a menu (system requirement) but Electron's
     // default is fine there.
     if (process.platform !== 'darwin') Menu.setApplicationMenu(null)
+    installMicrophonePermissionHandler()
     if (app.isPackaged) {
       installHermesStudioCliShim({
         nodePath: bundledNode(),
@@ -737,16 +916,12 @@ function runDesktopApp() {
       })
     }
     createTray()
-    createWindow()
-    bootstrap()
-    initAutoUpdater({
-      beforeQuitAndInstall: () => {
-        isQuitting = true
-      },
-    })
+    await createWindow()
+    void bootstrap()
+    initAutoUpdater({ beforeQuitAndInstall: prepareAppShutdown })
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) {
-        createWindow()
+        void createWindow()
       } else if (mainWindow) {
         showMainWindow()
       }
@@ -765,9 +940,7 @@ function runDesktopApp() {
       return
     }
     e.preventDefault()
-    cancelWindowFade()
-    await showShutdownSplash()
-    await stopWebUiServer().catch(() => undefined)
+    await prepareAppShutdown()
     app.exit(0)
   })
 }

@@ -10,12 +10,12 @@ function desktopWindowKind(): DesktopWindowKind {
 contextBridge.exposeInMainWorld('hermesDesktop', {
   getToken: (): Promise<string> => ipcRenderer.invoke('hermes-desktop:get-token'),
   retryBootstrap: (source?: 'cf' | 'github'): Promise<void> => ipcRenderer.invoke('hermes-desktop:retry-bootstrap', source),
+  selectRuntimeDirectory: (defaultPath?: string): Promise<string | null> => ipcRenderer.invoke('hermes-desktop:select-runtime-directory', defaultPath),
   notifyCompletion: (payload: { title: string; body?: string; icon?: string; tag?: string }): Promise<boolean> => ipcRenderer.invoke('hermes-desktop:notify-completion', payload),
   ensureAuth: async (): Promise<boolean> => {
     const token = await ipcRenderer.invoke('hermes-desktop:get-token')
     if (token) {
       try { localStorage.setItem('AUTH_TOKEN', token) } catch { /* */ }
-      await autoLogin(token)
     }
     return !!localStorage.getItem(API_KEY_LS)
   },
@@ -35,33 +35,6 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
 })
 
 const API_KEY_LS = 'hermes_api_key'
-const DEFAULT_USERNAME = 'admin'
-const DEFAULT_PASSWORD = '123456'
-
-// Auto-login the bundled web UI so users don't see a login screen on launch.
-// We POST to /api/auth/login with the well-known default credentials, using
-// the server's AUTH_TOKEN as the bearer (the server requires *some* auth on
-// /api/auth/login from a packaged client). The returned JWT is dropped into
-// localStorage where the Vue client expects it.
-async function autoLogin(token: string): Promise<void> {
-  if (localStorage.getItem(API_KEY_LS)) return
-  try {
-    const res = await fetch('/api/auth/login', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({ username: DEFAULT_USERNAME, password: DEFAULT_PASSWORD }),
-    })
-    if (!res.ok) return
-    const body = await res.json().catch(() => null) as { token?: string; jwt?: string } | null
-    const jwt = body?.token || body?.jwt
-    if (jwt) localStorage.setItem(API_KEY_LS, jwt)
-  } catch {
-    /* ignore — first-load race or server still starting */
-  }
-}
 
 // Silently strip the "你必须修改默认密码" flag from /api/auth/me responses on
 // desktop. Users on a single-machine install don't benefit from a managed
@@ -153,7 +126,6 @@ window.addEventListener('DOMContentLoaded', async () => {
     const token = await ipcRenderer.invoke('hermes-desktop:get-token')
     if (token) {
       try { localStorage.setItem('AUTH_TOKEN', token) } catch { /* */ }
-      await autoLogin(token)
     }
   } catch {
     /* ignore */

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const updateSessionStatsMock = vi.fn()
+const updateSessionMock = vi.fn()
 const flushBridgePendingToDbMock = vi.fn()
 const flushResponseRunToDbMock = vi.fn()
 const replaceStateMock = vi.fn()
@@ -11,6 +12,7 @@ const codingAgentRunManagerMock = vi.hoisted(() => ({
 }))
 
 vi.mock('../../packages/server/src/db/hermes/session-store', () => ({
+  updateSession: updateSessionMock,
   updateSessionStats: updateSessionStatsMock,
 }))
 
@@ -74,10 +76,30 @@ describe('run chat abort goal handling', () => {
       runId: 'run-1',
       profile: 'default',
       source: 'cli',
+      backgroundTasks: {
+        'child-1': {
+          subagent_id: 'child-1',
+          status: 'running',
+          task_index: 0,
+          task_count: 2,
+          goal: 'First task',
+        },
+        'child-2': {
+          subagent_id: 'child-2',
+          status: 'completed',
+          task_index: 1,
+          task_count: 2,
+          goal: 'Second task',
+        },
+      },
     } as any
     const sessionMap = new Map([['session-1', state]])
     const bridge = {
-      interrupt: vi.fn().mockResolvedValue({ ok: true }),
+      interrupt: vi.fn().mockResolvedValue({
+        ok: true,
+        background_interrupted: 1,
+        background_delegation_ids: ['deleg-1'],
+      }),
       goalPause: vi.fn().mockResolvedValue({ handled: true, status: 'paused', reason: 'user-interrupted' }),
     }
     const runQueuedItem = vi.fn()
@@ -90,10 +112,33 @@ describe('run chat abort goal handling', () => {
       queue_id: 'user-1',
     }), 'default')
     expect(state.queue).toEqual([])
+    expect(state.backgroundDelegations).toEqual({
+      'deleg-1': expect.objectContaining({
+        delegationId: 'deleg-1',
+        status: 'interrupted',
+      }),
+    })
+    expect(emit).toHaveBeenCalledWith('delegation.updated', expect.objectContaining({
+      session_id: 'session-1',
+      delegation_id: 'deleg-1',
+      status: 'interrupted',
+      delivery_status: 'cancelled',
+    }))
+    expect(state.backgroundTasks['child-1']).toEqual(expect.objectContaining({
+      status: 'interrupted',
+      last_event: 'subagent.complete',
+    }))
+    expect(state.backgroundTasks['child-2'].status).toBe('completed')
+    expect(emit).toHaveBeenCalledWith('subagent.complete', expect.objectContaining({
+      session_id: 'session-1',
+      subagent_id: 'child-1',
+      status: 'interrupted',
+    }))
     expect(emit).toHaveBeenCalledWith('abort.completed', expect.objectContaining({
       session_id: 'session-1',
       synced: true,
     }))
+    expect(updateSessionMock).not.toHaveBeenCalled()
   })
 
   it('releases local working state when a CLI interrupt does not sync before timeout', async () => {
@@ -138,6 +183,56 @@ describe('run chat abort goal handling', () => {
       session_id: 'session-1',
       run_id: 'run-1',
       synced: false,
+    }))
+    expect(updateSessionMock).toHaveBeenCalledWith('session-1', expect.objectContaining({
+      ended_at: expect.any(Number),
+      end_reason: 'abort',
+    }))
+  })
+
+
+  it('stops a workflow-scoped coding-agent run instead of misrouting abort through the bridge', async () => {
+    const { handleAbort } = await import('../../packages/server/src/services/hermes/run-chat/abort')
+    const { emit, nsp, socket } = makeHarness()
+    codingAgentRunManagerMock.hasSession.mockReturnValue(true)
+    codingAgentRunManagerMock.stop.mockReturnValue(true)
+    const state = {
+      messages: [],
+      isWorking: true,
+      isAborting: false,
+      events: [],
+      queue: [],
+      runId: 'coding-run-1',
+      profile: 'default',
+      source: 'workflow',
+    } as any
+    const sessionMap = new Map([['session-1', state]])
+    const bridge = {
+      interrupt: vi.fn().mockRejectedValue(new Error('unknown session: session-1')),
+      goalPause: vi.fn(),
+    }
+    const runQueuedItem = vi.fn()
+
+    await handleAbort(nsp as any, socket as any, 'session-1', sessionMap, bridge, runQueuedItem)
+
+    expect(bridge.interrupt).not.toHaveBeenCalled()
+    expect(bridge.goalPause).not.toHaveBeenCalled()
+    expect(codingAgentRunManagerMock.stop).toHaveBeenCalledWith('session-1', { reportClosed: false })
+    expect(updateSessionMock).toHaveBeenCalledWith('session-1', expect.objectContaining({
+      ended_at: expect.any(Number),
+      end_reason: 'abort',
+    }))
+    expect(flushResponseRunToDbMock).toHaveBeenCalledWith(expect.objectContaining({
+      source: 'workflow',
+    }), 'session-1')
+    expect(flushBridgePendingToDbMock).not.toHaveBeenCalled()
+    expect(codingAgentRunManagerMock.stop).toHaveBeenCalledWith('session-1', { reportClosed: false })
+    expect(state.isWorking).toBe(false)
+    expect(state.isAborting).toBe(false)
+    expect(emit).toHaveBeenCalledWith('abort.completed', expect.objectContaining({
+      session_id: 'session-1',
+      run_id: 'coding-run-1',
+      synced: true,
     }))
   })
 

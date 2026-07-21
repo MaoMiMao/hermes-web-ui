@@ -1,7 +1,7 @@
-import { getActiveProfileDir, getProfileDir } from '../../services/hermes/hermes-profile'
+import { getActiveProfileDir, getHermesBaseDir } from '../../services/hermes/hermes-profile'
 import { join } from 'path'
+import { existsSync } from 'fs'
 import type { LocalUsageStats } from './usage-store'
-import { getDb } from '../index'
 
 const SQLITE_AVAILABLE = (() => {
   const [major, minor] = process.versions.node.split('.').map(Number)
@@ -74,12 +74,31 @@ export interface PaginatedHermesSessionDetailResult {
   hasMore: boolean
 }
 
+export interface HermesSessionSummaryGroupPage {
+  source: string
+  sessions: HermesSessionRow[]
+  total: number
+  hasMore: boolean
+}
+
+export interface HermesSessionSummaryGroupsResult {
+  groups: HermesSessionSummaryGroupPage[]
+  included: HermesSessionRow[]
+}
+
 interface HermesSessionInternalRow extends HermesSessionRow {
   parent_session_id: string | null
 }
 
 function sessionDbPath(): string {
   return join(getActiveProfileDir(), 'state.db')
+}
+
+function sessionDbPathForProfile(profile?: string): string {
+  const name = String(profile || '').trim()
+  if (!name) return sessionDbPath()
+  if (name === 'default') return join(getHermesBaseDir(), 'state.db')
+  return join(getHermesBaseDir(), 'profiles', name, 'state.db')
 }
 
 function normalizeNumber(value: unknown, fallback = 0): number {
@@ -387,6 +406,12 @@ function latestSessionInChain(chain: HermesSessionInternalRow[]): HermesSessionI
   }, chain[0])
 }
 
+function compareSessionSummariesNewestFirst(a: HermesSessionRow, b: HermesSessionRow): number {
+  const activityDelta = Number(b.last_active || b.started_at || 0) - Number(a.last_active || a.started_at || 0)
+  if (activityDelta !== 0) return activityDelta
+  return b.id.localeCompare(a.id)
+}
+
 function projectSessionSummary(root: HermesSessionInternalRow, chain: HermesSessionInternalRow[]): HermesSessionRow {
   const latest = latestSessionInChain(chain)
   const firstPreview = chain.map(session => session.preview).find(Boolean) || root.preview
@@ -441,22 +466,91 @@ function loadAllSessions(db: { prepare: (sql: string) => { all: (...params: any[
   return { byId, childrenByParent }
 }
 
-function getLatestContinuationChild(
+type SessionLookupDb = {
+  prepare: (sql: string) => {
+    get: (...params: any[]) => Record<string, unknown> | undefined
+    all: (...params: any[]) => Record<string, unknown>[]
+  }
+}
+
+function loadSessionById(db: SessionLookupDb, sessionId: string): HermesSessionInternalRow | null {
+  const row = db.prepare(`
+    SELECT
+      ${SESSION_SELECT},
+      s.parent_session_id AS parent_session_id
+    FROM sessions s
+    WHERE s.id = ?
+      AND s.source != 'tool'
+      AND s.id NOT LIKE 'compress_%'
+  `).get(sessionId)
+  return row ? mapInternalSessionRow(row) : null
+}
+
+function loadContinuationChildren(db: SessionLookupDb, parentSessionId: string): HermesSessionInternalRow[] {
+  const rows = db.prepare(`
+    SELECT
+      ${SESSION_SELECT},
+      s.parent_session_id AS parent_session_id
+    FROM sessions s
+    WHERE s.parent_session_id = ?
+      AND s.source != 'tool'
+      AND s.id NOT LIKE 'compress_%'
+  `).all(parentSessionId)
+  return rows.map(mapInternalSessionRow)
+}
+
+function selectCompressionContinuationChild(
   parent: HermesSessionInternalRow,
-  idx: SessionIndex,
+  candidates: HermesSessionInternalRow[],
 ): HermesSessionInternalRow | null {
   if (!isCompressionEnded(parent) || parent.ended_at == null) return null
-  const candidates = (idx.childrenByParent.get(parent.id) || [])
-    .map(id => idx.byId.get(id))
-    .filter((c): c is HermesSessionInternalRow => !!c)
-    .filter(c => Number(c.started_at || 0) >= Number(parent.ended_at || 0))
+  return candidates
+    .filter(candidate => Number(candidate.started_at || 0) >= Number(parent.ended_at || 0))
     .sort((a, b) => {
       const aDelta = Number(a.started_at || 0) - Number(parent.ended_at || 0)
       const bDelta = Number(b.started_at || 0) - Number(parent.ended_at || 0)
       if (aDelta !== bDelta) return aDelta - bDelta
       return b.id.localeCompare(a.id)
-    })
-  return candidates[0] || null
+    })[0] || null
+}
+
+function loadSessionChain(db: SessionLookupDb, sessionId: string): HermesSessionInternalRow[] {
+  const requested = loadSessionById(db, sessionId)
+  if (!requested) return []
+
+  const reversed: HermesSessionInternalRow[] = [requested]
+  const ancestorIds = new Set<string>()
+  let current: HermesSessionInternalRow | null = requested
+  for (let depth = 0; current?.parent_session_id && depth < 100 && !ancestorIds.has(current.id); depth += 1) {
+    ancestorIds.add(current.id)
+    const parent = loadSessionById(db, current.parent_session_id)
+    if (!parent || !isCompressionContinuation(parent, current)) break
+    reversed.push(parent)
+    current = parent
+  }
+
+  const chain = reversed.reverse()
+  const chainIds = new Set(chain.map(session => session.id))
+  current = chain[chain.length - 1] || null
+  for (let depth = 0; current && depth < 100; depth += 1) {
+    if (!isCompressionEnded(current) || current.ended_at == null) break
+    const next = selectCompressionContinuationChild(current, loadContinuationChildren(db, current.id))
+    if (!next || chainIds.has(next.id)) break
+    chain.push(next)
+    chainIds.add(next.id)
+    current = next
+  }
+  return chain
+}
+
+function getLatestContinuationChild(
+  parent: HermesSessionInternalRow,
+  idx: SessionIndex,
+): HermesSessionInternalRow | null {
+  const candidates = (idx.childrenByParent.get(parent.id) || [])
+    .map(id => idx.byId.get(id))
+    .filter((c): c is HermesSessionInternalRow => !!c)
+  return selectCompressionContinuationChild(parent, candidates)
 }
 
 function collectCompressionPath(
@@ -591,7 +685,7 @@ async function openSessionDb(profile?: string) {
     throw new Error(`node:sqlite requires Node >= 22.5, current: ${process.versions.node}`)
   }
   const { DatabaseSync } = await import('node:sqlite')
-  const dbPath = profile ? join(getProfileDir(profile), 'state.db') : sessionDbPath()
+  const dbPath = profile ? sessionDbPathForProfile(profile) : sessionDbPath()
   try {
     return new DatabaseSync(dbPath, { open: true, readOnly: true })
   } catch (err: any) {
@@ -634,11 +728,7 @@ export async function getSessionMessagesFromDb(sessionId: string): Promise<{
 export async function getSessionDetailFromDb(sessionId: string): Promise<HermesSessionDetailRow | null> {
   const db = await openSessionDb()
   try {
-    const idx = loadAllSessions(db)
-    const requested = idx.byId.get(sessionId) || null
-    if (!requested) return null
-
-    const chain = collectSessionChainForMatchedSession(requested, idx)
+    const chain = loadSessionChain(db, sessionId)
     if (!chain.length) return null
 
     const ids = chain.map(session => session.id)
@@ -658,14 +748,10 @@ export async function getSessionDetailFromDb(sessionId: string): Promise<HermesS
 
 export async function getSessionDetailFromDbWithProfile(sessionId: string, profile: string): Promise<HermesSessionDetailRow | null> {
   const { DatabaseSync } = await import('node:sqlite')
-  const dbPath = join(getProfileDir(profile), 'state.db')
+  const dbPath = sessionDbPathForProfile(profile)
   const db = new DatabaseSync(dbPath, { open: true, readOnly: true })
   try {
-    const idx = loadAllSessions(db)
-    const requested = idx.byId.get(sessionId) || null
-    if (!requested) return null
-
-    const chain = collectSessionChainForMatchedSession(requested, idx)
+    const chain = loadSessionChain(db, sessionId)
     if (!chain.length) return null
 
     const ids = chain.map(session => session.id)
@@ -691,11 +777,7 @@ export async function getSessionDetailPaginatedFromDbWithProfile(
 ): Promise<PaginatedHermesSessionDetailResult | null> {
   const db = await openSessionDb(profile)
   try {
-    const idx = loadAllSessions(db)
-    const requested = idx.byId.get(sessionId) || null
-    if (!requested) return null
-
-    const chain = collectSessionChainForMatchedSession(requested, idx)
+    const chain = loadSessionChain(db, sessionId)
     if (!chain.length) return null
 
     const ids = chain.map(session => session.id)
@@ -731,11 +813,10 @@ export async function getSessionDetailPaginatedFromDbWithProfile(
 
 export async function getExactSessionDetailFromDbWithProfile(sessionId: string, profile: string): Promise<HermesSessionDetailRow | null> {
   const { DatabaseSync } = await import('node:sqlite')
-  const dbPath = join(getProfileDir(profile), 'state.db')
+  const dbPath = sessionDbPathForProfile(profile)
   const db = new DatabaseSync(dbPath, { open: true, readOnly: true })
   try {
-    const idx = loadAllSessions(db)
-    const requested = idx.byId.get(sessionId) || null
+    const requested = loadSessionById(db, sessionId)
     if (!requested) return null
 
     const messageRows = db.prepare(`
@@ -763,7 +844,7 @@ export async function findLatestExactSessionIdWithProfile(
   if (!trimmed) return null
 
   const { DatabaseSync } = await import('node:sqlite')
-  const dbPath = join(getProfileDir(profile), 'state.db')
+  const dbPath = sessionDbPathForProfile(profile)
   const db = new DatabaseSync(dbPath, { open: true, readOnly: true })
   const loweredQuery = trimmed.toLowerCase()
   const likePattern = buildLikePattern(loweredQuery)
@@ -910,6 +991,13 @@ function parseJsonObject(value: unknown): Record<string, unknown> | null {
 
 type SkillUsageAction = 'view' | 'manage'
 
+type SqliteDbLike = {
+  prepare(sql: string): {
+    get(...params: unknown[]): unknown
+    all(...params: unknown[]): unknown[]
+  }
+}
+
 interface RawSkillUsageEvent {
   skill: string
   action: SkillUsageAction
@@ -921,7 +1009,18 @@ function extractSkillNameFromViewContent(content: string): string {
   if (match?.[1]) return match[1].trim()
 
   const parsed = parseJsonObject(content)
-  return typeof parsed?.name === 'string' ? parsed.name.trim() : ''
+  if (typeof parsed?.name === 'string') return parsed.name.trim()
+
+  const jsonNameMatch = content.match(/"name"\s*:\s*"((?:\\.|[^"\\])*)"/)
+  if (jsonNameMatch?.[1]) {
+    try {
+      return JSON.parse(`"${jsonNameMatch[1]}"`).trim()
+    } catch {
+      return jsonNameMatch[1].replace(/\\"/g, '"').trim()
+    }
+  }
+
+  return ''
 }
 
 function extractSkillNameFromManageContent(content: string): string {
@@ -953,13 +1052,11 @@ function extractSkillToolCall(row: Record<string, unknown>): { action: SkillUsag
   for (const call of calls) {
     if (!call || typeof call !== 'object') continue
     const record = call as Record<string, unknown>
+    if (!toolCallRecordIds(record).includes(toolCallId)) continue
+
     const functionRecord = record.function && typeof record.function === 'object'
       ? record.function as Record<string, unknown>
       : {}
-    const ids = [record.id, record.call_id, record.tool_call_id, functionRecord.call_id]
-      .filter((value): value is string => typeof value === 'string')
-    if (!ids.includes(toolCallId)) continue
-
     const name = typeof functionRecord.name === 'string'
       ? functionRecord.name
       : typeof record.name === 'string'
@@ -980,21 +1077,105 @@ function extractSkillToolCall(row: Record<string, unknown>): { action: SkillUsag
   return null
 }
 
+function toolCallRecordIds(record: Record<string, unknown>): string[] {
+  const functionRecord = record.function && typeof record.function === 'object'
+    ? record.function as Record<string, unknown>
+    : {}
+  return [record.id, record.call_id, record.tool_call_id, functionRecord.call_id]
+    .filter((value): value is string => typeof value === 'string')
+}
+
+function buildAssistantToolCallLookup(rows: Record<string, unknown>[]): Map<string, string> {
+  const lookup = new Map<string, string>()
+  for (const row of rows) {
+    const sessionId = typeof row.session_id === 'string' ? row.session_id : ''
+    const rawToolCalls = typeof row.tool_calls === 'string' ? row.tool_calls : ''
+    if (!sessionId || !rawToolCalls) continue
+
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(rawToolCalls)
+    } catch {
+      continue
+    }
+
+    const calls = Array.isArray(parsed) ? parsed : [parsed]
+    for (const call of calls) {
+      if (!call || typeof call !== 'object') continue
+      const record = call as Record<string, unknown>
+      const functionRecord = record.function && typeof record.function === 'object'
+        ? record.function as Record<string, unknown>
+        : {}
+      const name = typeof functionRecord.name === 'string'
+        ? functionRecord.name
+        : typeof record.name === 'string'
+          ? record.name
+          : ''
+      if (name !== 'skill_view' && name !== 'skill_manage') continue
+      const serialized = JSON.stringify([record])
+      for (const id of toolCallRecordIds(record)) {
+        lookup.set(`${sessionId}\u0000${id}`, serialized)
+      }
+    }
+  }
+  return lookup
+}
+
+function attachAssistantToolCalls(
+  candidateRows: Record<string, unknown>[],
+  assistantRows: Record<string, unknown>[],
+): Record<string, unknown>[] {
+  const lookup = buildAssistantToolCallLookup(assistantRows)
+  return candidateRows.map(row => {
+    const sessionId = typeof row.session_id === 'string' ? row.session_id : ''
+    const toolCallId = typeof row.tool_call_id === 'string' ? row.tool_call_id : ''
+    if (!sessionId || !toolCallId) return row
+    const assistantToolCalls = lookup.get(`${sessionId}\u0000${toolCallId}`)
+    return assistantToolCalls ? { ...row, assistant_tool_calls: assistantToolCalls } : row
+  })
+}
+
+function chunkValues<T>(values: T[], size: number): T[][] {
+  const chunks: T[][] = []
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size))
+  }
+  return chunks
+}
+
+function sqliteIndexHint(db: SqliteDbLike, indexName: 'idx_sessions_started' | 'idx_messages_session'): string {
+  try {
+    const row = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(indexName)
+    return row ? ` INDEXED BY ${indexName}` : ''
+  } catch {
+    return ''
+  }
+}
+
 function mapSkillUsageEvent(row: Record<string, unknown>): RawSkillUsageEvent | null {
   const content = typeof row.content === 'string' ? row.content : ''
   const toolName = typeof row.tool_name === 'string' ? row.tool_name : ''
-  const toolCall = extractSkillToolCall(row)
-  const action: SkillUsageAction | null = toolName === 'skill_view' || content.startsWith('[skill_view]')
+  let toolCall: { action: SkillUsageAction; skill: string } | null = null
+  let action: SkillUsageAction | null = toolName === 'skill_view' || content.startsWith('[skill_view]')
     ? 'view'
     : toolName === 'skill_manage' || content.startsWith('[skill_manage]')
       ? 'manage'
-      : toolCall?.action ?? null
+      : null
+
+  if (!action) {
+    toolCall = extractSkillToolCall(row)
+    action = toolCall?.action ?? null
+  }
 
   if (!action) return null
 
-  const skill = toolCall?.skill || (action === 'view'
+  let skill = action === 'view'
     ? extractSkillNameFromViewContent(content)
-    : extractSkillNameFromManageContent(content))
+    : extractSkillNameFromManageContent(content)
+  if (!skill) {
+    toolCall = toolCall || extractSkillToolCall(row)
+    skill = toolCall?.skill || ''
+  }
 
   if (!skill) return null
 
@@ -1010,6 +1191,20 @@ function formatUnixDate(timestamp: number | null): string {
   return new Date(timestamp * 1000).toISOString().slice(0, 10)
 }
 
+function emptySkillUsageStats(periodDays: number): HermesSkillUsageStats {
+  return {
+    period_days: periodDays,
+    summary: {
+      total_skill_loads: 0,
+      total_skill_edits: 0,
+      total_skill_actions: 0,
+      distinct_skills_used: 0,
+    },
+    by_day: [],
+    top_skills: [],
+  }
+}
+
 export async function getSkillUsageStatsFromDb(
   days = 7,
   nowSeconds = Math.floor(Date.now() / 1000),
@@ -1018,83 +1213,88 @@ export async function getSkillUsageStatsFromDb(
   const normalizedDays = Number.isFinite(days) ? days : 7
   const safeDays = Math.max(1, Math.floor(normalizedDays))
   const since = nowSeconds - safeDays * 24 * 60 * 60
-  const db = getDb()
-  if (!db) throw new Error('SQLite is not available')
+  const dbPath = profile ? sessionDbPathForProfile(profile) : sessionDbPath()
+  if (!existsSync(dbPath)) return emptySkillUsageStats(safeDays)
 
-  const profileName = profile?.trim()
-  const profilePredicate = profileName ? 'AND s.profile = ?' : ''
-  const profileParams = profileName ? [profileName] : []
-  const skillContentExpression = `
-    CASE
-      WHEN m.tool_name IN ('skill_view', 'skill_manage')
-        OR m.content LIKE '[skill_view]%'
-        OR m.content LIKE '[skill_manage]%'
-      THEN m.content
-      ELSE ''
-    END
+  const db = await openSessionDb(profile)
+
+  const sessionsIndexHint = sqliteIndexHint(db, 'idx_sessions_started')
+  const messagesIndexHint = sqliteIndexHint(db, 'idx_messages_session')
+  const compactToolPredicate = `
+    COALESCE(m.tool_name, '') IN ('skill_view', 'skill_manage')
+    OR COALESCE(m.content, '') LIKE '[skill_view]%'
+    OR COALESCE(m.content, '') LIKE '[skill_manage]%'
   `
-  const toolPredicate = `
-    m.role = 'tool'
-    AND (
-      m.tool_name IN ('skill_view', 'skill_manage')
-      OR m.content LIKE '[skill_view]%'
-      OR m.content LIKE '[skill_manage]%'
-      OR m.tool_call_id IS NOT NULL
-    )
-  `
-  const recentRows = db.prepare(`
+  const eventTimeExpression = 'COALESCE(m.timestamp, s.started_at)'
+  const rowSelect = `
     SELECT
+      m.id AS message_id,
+      m.session_id,
       m.tool_name,
       m.tool_call_id,
-      ${skillContentExpression} AS content,
-      COALESCE(m.timestamp, s.started_at) AS timestamp,
-      (
-        SELECT a.tool_calls
-        FROM messages a
-        WHERE a.session_id = m.session_id
-          AND a.role = 'assistant'
-          AND m.tool_call_id IS NOT NULL
-          AND a.tool_calls LIKE '%' || m.tool_call_id || '%'
-        ORDER BY a.timestamp DESC
-        LIMIT 1
-      ) AS assistant_tool_calls
-    FROM sessions s
-    JOIN messages m ON m.session_id = s.id
-    WHERE ${toolPredicate}
-      ${profilePredicate}
-      AND s.started_at > ?
-  `).all(...profileParams, since) as Record<string, unknown>[]
-  const lateRows = db.prepare(`
-    SELECT
-      m.tool_name,
-      m.tool_call_id,
-      ${skillContentExpression} AS content,
-      COALESCE(m.timestamp, s.started_at) AS timestamp,
-      (
-        SELECT a.tool_calls
-        FROM messages a
-        WHERE a.session_id = m.session_id
-          AND a.role = 'assistant'
-          AND m.tool_call_id IS NOT NULL
-          AND a.tool_calls LIKE '%' || m.tool_call_id || '%'
-        ORDER BY a.timestamp DESC
-        LIMIT 1
-      ) AS assistant_tool_calls
-    FROM sessions s
-    JOIN messages m ON m.session_id = s.id
-    WHERE ${toolPredicate}
-      ${profilePredicate}
-      AND s.started_at <= ?
-      AND COALESCE(m.timestamp, s.started_at) > ?
-  `).all(...profileParams, since, since) as Record<string, unknown>[]
+      SUBSTR(m.content, 1, 300) AS content,
+      ${eventTimeExpression} AS timestamp
+    FROM sessions s${sessionsIndexHint}
+    JOIN messages m${messagesIndexHint} ON m.session_id = s.id
+  `
+  let rawRows: Record<string, unknown>[]
+  try {
+    const selectCandidateRows = (predicate: string): Record<string, unknown>[] => {
+      const recentRows = db.prepare(`
+        ${rowSelect}
+        WHERE m.role = 'tool'
+          AND (${predicate})
+          AND s.started_at > ?
+          AND ${eventTimeExpression} > ?
+      `).all(since, since) as Record<string, unknown>[]
+      const lateRows = db.prepare(`
+        ${rowSelect}
+        WHERE m.role = 'tool'
+          AND (${predicate})
+          AND s.started_at <= ?
+          AND ${eventTimeExpression} > ?
+      `).all(since, since) as Record<string, unknown>[]
+      return [...recentRows, ...lateRows]
+    }
+
+    const compactRows = selectCandidateRows(compactToolPredicate)
+    const toolCallRows = selectCandidateRows('m.tool_call_id IS NOT NULL')
+    const toolCallSessionIds = [...new Set(
+      toolCallRows
+        .map(row => typeof row.session_id === 'string' ? row.session_id : '')
+        .filter(Boolean),
+    )]
+    const assistantRows: Record<string, unknown>[] = []
+    for (const chunk of chunkValues(toolCallSessionIds, 500)) {
+      const placeholders = chunk.map(() => '?').join(', ')
+      assistantRows.push(...db.prepare(`
+        SELECT session_id, tool_calls
+        FROM messages${messagesIndexHint}
+        WHERE role = 'assistant'
+          AND tool_calls IS NOT NULL
+          AND (tool_calls LIKE '%skill_view%' OR tool_calls LIKE '%skill_manage%')
+          AND session_id IN (${placeholders})
+      `).all(...chunk) as Record<string, unknown>[])
+    }
+    rawRows = [...compactRows, ...attachAssistantToolCalls(toolCallRows, assistantRows)]
+  } finally {
+    db.close()
+  }
 
   const skillMap = new Map<string, { skill: string; view_count: number; manage_count: number; last_used_at: number | null }>()
   const dayMap = new Map<string, { date: string; view_count: number; manage_count: number }>()
   const daySkillMap = new Map<string, Map<string, { skill: string; view_count: number; manage_count: number }>>()
+  const countedMessageIds = new Set<string>()
 
-  for (const row of [...recentRows, ...lateRows]) {
+  for (const row of rawRows) {
     const event = mapSkillUsageEvent(row)
     if (!event) continue
+    const messageId = normalizeNullableNumber(row.message_id)
+    if (messageId != null) {
+      const messageKey = String(messageId)
+      if (countedMessageIds.has(messageKey)) continue
+      countedMessageIds.add(messageKey)
+    }
 
     const entry = skillMap.get(event.skill) || {
       skill: event.skill,
@@ -1171,6 +1371,7 @@ export async function getUsageStatsFromDb(
   days = 30,
   nowSeconds = Math.floor(Date.now() / 1000),
   profile?: string,
+  excludedSessionIds: Iterable<string> = [],
 ): Promise<HermesUsageStats> {
   const empty: HermesUsageStats = {
     input_tokens: 0,
@@ -1180,6 +1381,7 @@ export async function getUsageStatsFromDb(
     reasoning_tokens: 0,
     sessions: 0,
     by_model: [],
+    by_agent: [],
     by_day: [],
     cost: 0,
     total_api_calls: 0,
@@ -1188,6 +1390,11 @@ export async function getUsageStatsFromDb(
   const normalizedDays = Number.isFinite(days) ? days : 30
   const safeDays = Math.max(1, Math.floor(normalizedDays))
   const since = nowSeconds - safeDays * 24 * 60 * 60
+  const excludedIds = [...new Set([...excludedSessionIds].map(id => String(id || '').trim()).filter(Boolean))]
+  const exclusionClause = excludedIds.length > 0
+    ? ` AND id NOT IN (SELECT value FROM json_each(?))`
+    : ''
+  const queryParams = excludedIds.length > 0 ? [since, JSON.stringify(excludedIds)] : [since]
   const db = await openSessionDb(profile)
 
   try {
@@ -1205,8 +1412,8 @@ export async function getUsageStatsFromDb(
         COUNT(*) AS sessions,
         ${apiCallsExpr} AS total_api_calls
       FROM sessions
-      WHERE started_at > ?
-    `).get(since) as Record<string, unknown> | undefined
+      WHERE started_at > ?${exclusionClause}
+    `).get(...queryParams) as Record<string, unknown> | undefined
 
     if (!totals) return empty
 
@@ -1220,10 +1427,10 @@ export async function getUsageStatsFromDb(
         COALESCE(SUM(reasoning_tokens), 0) AS reasoning_tokens,
         COUNT(*) AS sessions
       FROM sessions
-      WHERE started_at > ? AND model IS NOT NULL
+      WHERE started_at > ? AND model IS NOT NULL${exclusionClause}
       GROUP BY model
       ORDER BY COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0) DESC
-    `).all(since).map(row => ({
+    `).all(...queryParams).map(row => ({
       model: String(row.model || ''),
       input_tokens: normalizeNumber(row.input_tokens),
       output_tokens: normalizeNumber(row.output_tokens),
@@ -1243,10 +1450,10 @@ export async function getUsageStatsFromDb(
         COUNT(*) AS sessions,
         COALESCE(SUM(COALESCE(actual_cost_usd, estimated_cost_usd, 0)), 0) AS cost
       FROM sessions
-      WHERE started_at > ?
+      WHERE started_at > ?${exclusionClause}
       GROUP BY date
       ORDER BY date ASC
-    `).all(since).map(row => ({
+    `).all(...queryParams).map(row => ({
       date: String(row.date || ''),
       input_tokens: normalizeNumber(row.input_tokens),
       output_tokens: normalizeNumber(row.output_tokens),
@@ -1265,6 +1472,17 @@ export async function getUsageStatsFromDb(
       reasoning_tokens: normalizeNumber(totals.reasoning_tokens),
       sessions: normalizeNumber(totals.sessions),
       by_model: byModel,
+      by_agent: normalizeNumber(totals.sessions) > 0
+        ? [{
+            agent: 'hermes',
+            input_tokens: normalizeNumber(totals.input_tokens),
+            output_tokens: normalizeNumber(totals.output_tokens),
+            cache_read_tokens: normalizeNumber(totals.cache_read_tokens),
+            cache_write_tokens: normalizeNumber(totals.cache_write_tokens),
+            reasoning_tokens: normalizeNumber(totals.reasoning_tokens),
+            sessions: normalizeNumber(totals.sessions),
+          }]
+        : [],
       by_day: byDay,
       cost: normalizeNumber(totals.cost),
       total_api_calls: normalizeNumber(totals.total_api_calls),
@@ -1280,7 +1498,7 @@ export async function listSessionSummaries(source?: string, limit = 2000, profil
   }
 
   const { DatabaseSync } = await import('node:sqlite')
-  const dbPath = profile ? join(getProfileDir(profile), 'state.db') : sessionDbPath()
+  const dbPath = profile ? sessionDbPathForProfile(profile) : sessionDbPath()
   const db = new DatabaseSync(dbPath, { open: true, readOnly: true })
 
   try {
@@ -1306,8 +1524,50 @@ export async function listSessionSummaries(source?: string, limit = 2000, profil
     const idx = loadAllSessions(db)
     return roots
       .map(root => projectSessionSummary(root, collectSessionChain(root, idx)))
-      .sort((a, b) => Number(b.last_active || b.started_at || 0) - Number(a.last_active || a.started_at || 0))
+      .sort(compareSessionSummariesNewestFirst)
       .slice(0, limit)
+  } finally {
+    db.close()
+  }
+}
+
+export async function listSessionSummaryGroups(
+  limitPerSource = 20,
+  profile?: string,
+  includedSessionIds: string[] = [],
+): Promise<HermesSessionSummaryGroupsResult> {
+  if (!SQLITE_AVAILABLE) {
+    throw new Error(`node:sqlite requires Node >= 22.5, current: ${process.versions.node}`)
+  }
+
+  const db = await openSessionDb(profile)
+  try {
+    const idx = loadAllSessions(db)
+    const grouped = new Map<string, HermesSessionRow[]>()
+    const includedIds = new Set(includedSessionIds)
+    const included = new Map<string, HermesSessionRow>()
+
+    for (const root of idx.byId.values()) {
+      if (root.parent_session_id != null) continue
+      const summary = projectSessionSummary(root, collectSessionChain(root, idx))
+      const sessions = grouped.get(summary.source) || []
+      sessions.push(summary)
+      grouped.set(summary.source, sessions)
+      if (includedIds.has(summary.id)) included.set(summary.id, summary)
+    }
+
+    const normalizedLimit = Math.max(1, limitPerSource)
+    const groups = [...grouped.entries()].map(([source, sessions]) => {
+      sessions.sort(compareSessionSummariesNewestFirst)
+      return {
+        source,
+        sessions: sessions.slice(0, normalizedLimit),
+        total: sessions.length,
+        hasMore: sessions.length > normalizedLimit,
+      }
+    })
+
+    return { groups, included: [...included.values()] }
   } finally {
     db.close()
   }
@@ -1327,7 +1587,7 @@ export async function searchSessionSummariesWithProfile(
   if (!trimmed) return []
 
   const { DatabaseSync } = await import('node:sqlite')
-  const dbPath = join(getProfileDir(profile), 'state.db')
+  const dbPath = sessionDbPathForProfile(profile)
   const db = new DatabaseSync(dbPath, { open: true, readOnly: true })
   const normalized = sanitizeFtsQuery(trimmed)
   const prefixQuery = toPrefixQuery(normalized)

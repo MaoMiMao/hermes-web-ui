@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { NButton, NInput, NSelect, useMessage } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import { useSpeech, type MimoTtsOptions, type OpenaiTtsOptions } from '@/composables/useSpeech'
-import { useMicRecorder } from '@/composables/useMicRecorder'
+import { usePcmStreamRecorder } from '@/composables/usePcmStreamRecorder'
 import { transcribeSpeech } from '@/api/hermes/stt'
 import { useVoiceApiConnections } from '@/composables/useVoiceApiConnections'
+import { useVoiceSettings } from '@/composables/useVoiceSettings'
 import { speedToEdgeRate, hzToEdgePitch } from '@/utils/ttsHelpers'
 import VoiceApiCard, { type VoiceApiCardTestState } from './voice/VoiceApiCard.vue'
 import VoiceApiFormModal from './voice/VoiceApiFormModal.vue'
@@ -23,13 +24,14 @@ const { t } = useI18n()
 const message = useMessage()
 const speech = useSpeech()
 const voiceApi = useVoiceApiConnections()
+const voiceSettings = useVoiceSettings()
 
 const testText = ref(t('settings.voice.testTextDefault'))
 const showAddModal = ref(false)
 const addModalKind = ref<VoiceApiKind>('tts')
 const showConfigurator = ref(false)
 const editingConnection = ref<VoiceApiConnection | null>(null)
-const sttRecorder = useMicRecorder({ maxDurationMs: 30_000 })
+const sttRecorder = usePcmStreamRecorder({ voiceActivityThreshold: 0.02 })
 const cardTestStates = ref<Record<string, VoiceApiCardTestState>>({})
 
 const activeTtsDescription = computed(() => voiceApi.activeTtsConnection.value?.label || t('settings.voice.noneSelected'))
@@ -37,6 +39,10 @@ const activeSttDescription = computed(() => voiceApi.activeSttConnection.value?.
 
 onMounted(async () => {
   await voiceApi.refresh()
+})
+
+onBeforeUnmount(() => {
+  sttRecorder.cancel()
 })
 
 function openAddModal(kind: VoiceApiKind) {
@@ -151,8 +157,12 @@ function mimoOptionsFor(connection: VoiceApiConnection): MimoTtsOptions {
     authMode: options.authMode === 'api-key' || options.authMode === 'bearer' || options.authMode === 'both' ? options.authMode : undefined,
     voiceMode: options.voiceMode === 'preset' || options.voiceMode === 'voiceDesign' || options.voiceMode === 'voiceClone' ? options.voiceMode : undefined,
     voiceDesignDesc: typeof options.voiceDesignDesc === 'string' ? options.voiceDesignDesc : undefined,
-    voiceCloneDataUri: typeof options.voiceCloneDataUri === 'string' ? options.voiceCloneDataUri : undefined,
-    voiceCloneFormat: options.voiceCloneFormat === 'mp3' || options.voiceCloneFormat === 'wav' ? options.voiceCloneFormat : undefined,
+    voiceCloneDataUri: typeof options.voiceCloneDataUri === 'string'
+      ? options.voiceCloneDataUri
+      : voiceSettings.mimoVoiceCloneDataUri.value || undefined,
+    voiceCloneFormat: options.voiceCloneFormat === 'mp3' || options.voiceCloneFormat === 'wav'
+      ? options.voiceCloneFormat
+      : voiceSettings.mimoVoiceCloneFormat.value,
     stylePrompt: typeof options.stylePrompt === 'string' ? options.stylePrompt : undefined,
   }
 }
@@ -197,7 +207,7 @@ async function handleSttTest(connection: VoiceApiConnection) {
     setCardTestState(connection.id, 'loading', t('settings.voice.transcribing'))
     try {
       const audio = await sttRecorder.stop()
-      if (!audio.size) {
+      if (!audio?.size) {
         setCardTestState(connection.id, 'error', t('settings.voice.sttEmptyAudio'))
         return
       }

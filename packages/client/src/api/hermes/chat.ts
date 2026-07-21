@@ -1,5 +1,6 @@
 import { io, type Socket } from 'socket.io-client'
 import { getBaseUrlValue, getApiKey } from '../client'
+import type { ChatCodingAgentId } from '../coding-agents'
 import type { ProviderApiMode } from './system'
 
 export type ContentBlock =
@@ -23,16 +24,19 @@ export interface StartRunRequest {
   queue_id?: string
   source?: 'api_server' | 'cli' | 'coding_agent' | 'global_agent' | 'workflow'
   session_source?: 'global_agent' | 'workflow'
-  coding_agent_id?: 'claude-code' | 'codex'
-  agent_id?: 'claude-code' | 'codex'
+  coding_agent_id?: ChatCodingAgentId
+  agent_id?: ChatCodingAgentId
   mode?: 'scoped' | 'global'
   workspace?: string | null
+  category_id?: number | null
   baseUrl?: string
   base_url?: string
   apiKey?: string
   api_key?: string
   apiMode?: ProviderApiMode
   api_mode?: ProviderApiMode
+  mcpServers?: Record<string, unknown>
+  mcp_servers?: Record<string, unknown>
   /** Per-session reasoning effort override.
    * Empty/undefined = use config.yaml default. */
   reasoning_effort?: string
@@ -50,6 +54,8 @@ export interface RunEvent {
   delta?: string
   /** Payload text for `reasoning.delta` / `thinking.delta` / `reasoning.available` events. */
   text?: string
+  /** Whether a `message.interim` payload was already delivered by message.delta. */
+  already_streamed?: boolean
   /** MoA reference metadata forwarded as display-only reasoning. */
   label?: string
   index?: number
@@ -71,6 +77,8 @@ export interface RunEvent {
   output?: string | null
   /** Run-level workspace diff summary attached to terminal run events. */
   workspace_run_change?: unknown
+  /** Provider/runtime context returned by Ekko Agent for follow-up runs. */
+  context?: unknown
   usage?: {
     input_tokens: number
     output_tokens: number
@@ -80,8 +88,30 @@ export interface RunEvent {
   session_id?: string
   /** Generated session title from session.title.updated. */
   title?: string
+  /** Session workspace from session.workspace.updated. */
+  workspace?: string | null
   /** Queue length from run.queued event */
   queue_length?: number
+  /** Number of background delegations still running or awaiting delivery. */
+  background_pending?: number
+  /** True when this run was started by a delivered background completion. */
+  autonomous?: boolean
+  delegation_id?: string
+  subagent_id?: string
+  task_index?: number
+  task_count?: number
+  goal?: string
+  model?: string
+  status?: string
+  summary?: string
+  arguments?: unknown
+  tool_count?: number
+  duration_seconds?: number
+  background_seq?: number
+  api_calls?: number
+  input_tokens?: number
+  output_tokens?: number
+  cost_usd?: number
   /** Queue item that was just removed because it is starting now. */
   dequeued_queue_id?: string
   /** Queued user messages from run.queued/resume payloads. */
@@ -115,8 +145,11 @@ export interface ResumeSessionPayload {
   inputTokens?: number
   outputTokens?: number
   contextTokens?: number
+  workspace?: string | null
   queueLength?: number
   queueMessages?: RunEvent['queued_messages']
+  backgroundTasks?: Array<Record<string, unknown>>
+  backgroundPending?: number
 }
 
 // ============================
@@ -141,6 +174,7 @@ const TRANSIENT_DISCONNECT_REASONS = new Set<string>([
  */
 const sessionEventHandlers = new Map<string, {
   onMessageDelta: (event: RunEvent) => void
+  onMessageInterim: (event: RunEvent) => void
   onReasoningDelta: (event: RunEvent) => void
   onThinkingDelta: (event: RunEvent) => void
   onReasoningAvailable: (event: RunEvent) => void
@@ -160,6 +194,7 @@ const sessionEventHandlers = new Map<string, {
   onAgentEvent?: (event: RunEvent) => void
   onSessionCommand?: (event: RunEvent) => void
   onSessionTitleUpdated?: (event: RunEvent) => void
+  onSessionWorkspaceUpdated?: (event: RunEvent) => void
   onRunQueued?: (event: RunEvent) => void
   onApprovalRequested?: (event: RunEvent) => void
   onApprovalResolved?: (event: RunEvent) => void
@@ -171,6 +206,7 @@ const sessionEventHandlers = new Map<string, {
 const peerUserMessageHandlers = new Set<(event: RunEvent) => void>()
 const sessionCommandHandlers = new Set<(event: RunEvent) => void>()
 const sessionTitleUpdatedHandlers = new Set<(event: RunEvent) => void>()
+const sessionWorkspaceUpdatedHandlers = new Set<(event: RunEvent) => void>()
 
 /**
  * Global message.delta event handler
@@ -184,6 +220,13 @@ function globalMessageDeltaHandler(event: RunEvent): void {
   if (handlers?.onMessageDelta) {
     handlers.onMessageDelta(event)
   }
+}
+
+function globalMessageInterimHandler(event: RunEvent): void {
+  const sid = event.session_id
+  if (!sid) return
+
+  sessionEventHandlers.get(sid)?.onMessageInterim(event)
 }
 
 /**
@@ -297,7 +340,7 @@ function globalRunCompletedHandler(event: RunEvent): void {
   }
 
   // Auto-cleanup session handlers on completion (skip if more runs queued)
-  if ((event as any).queue_remaining > 0) return
+  if ((event as any).queue_remaining > 0 || (event.background_pending || 0) > 0) return
   sessionEventHandlers.delete(sid)
 }
 
@@ -314,7 +357,7 @@ function globalRunFailedHandler(event: RunEvent): void {
   }
 
   // Auto-cleanup session handlers on failure (skip if more runs queued)
-  if ((event as any).queue_remaining > 0) return
+  if ((event as any).queue_remaining > 0 || (event.background_pending || 0) > 0) return
   sessionEventHandlers.delete(sid)
 }
 
@@ -442,6 +485,20 @@ function globalSessionTitleUpdatedHandler(event: RunEvent): void {
   }
 }
 
+function globalSessionWorkspaceUpdatedHandler(event: RunEvent): void {
+  const sid = event.session_id
+  if (!sid) return
+
+  const handlers = sessionEventHandlers.get(sid)
+  if (handlers) {
+    handlers.onSessionWorkspaceUpdated?.(event)
+  }
+
+  for (const handler of sessionWorkspaceUpdatedHandlers) {
+    handler(event)
+  }
+}
+
 function globalAgentEventHandler(event: RunEvent): void {
   const sid = event.session_id
   if (!sid) return
@@ -526,6 +583,7 @@ export function registerSessionHandlers(
   sessionId: string,
   handlers: {
     onMessageDelta: (event: RunEvent) => void
+    onMessageInterim: (event: RunEvent) => void
     onReasoningDelta: (event: RunEvent) => void
     onThinkingDelta: (event: RunEvent) => void
     onReasoningAvailable: (event: RunEvent) => void
@@ -545,6 +603,7 @@ export function registerSessionHandlers(
     onAgentEvent?: (event: RunEvent) => void
     onSessionCommand?: (event: RunEvent) => void
     onSessionTitleUpdated?: (event: RunEvent) => void
+    onSessionWorkspaceUpdated?: (event: RunEvent) => void
     onRunQueued?: (event: RunEvent) => void
     onApprovalRequested?: (event: RunEvent) => void
     onApprovalResolved?: (event: RunEvent) => void
@@ -587,6 +646,13 @@ export function onSessionTitleUpdated(handler: (event: RunEvent) => void): () =>
   sessionTitleUpdatedHandlers.add(handler)
   return () => {
     sessionTitleUpdatedHandlers.delete(handler)
+  }
+}
+
+export function onSessionWorkspaceUpdated(handler: (event: RunEvent) => void): () => void {
+  sessionWorkspaceUpdatedHandlers.add(handler)
+  return () => {
+    sessionWorkspaceUpdatedHandlers.delete(handler)
   }
 }
 
@@ -676,6 +742,7 @@ export function connectChatRun(requestedProfile?: string | null, transport: Chat
   if (!globalListenersRegistered) {
     // Message events
     chatRunSocket.on('message.delta', globalMessageDeltaHandler)
+    chatRunSocket.on('message.interim', globalMessageInterimHandler)
     chatRunSocket.on('reasoning.delta', globalReasoningDeltaHandler)
     chatRunSocket.on('thinking.delta', globalThinkingDeltaHandler)
     chatRunSocket.on('reasoning.available', globalReasoningAvailableHandler)
@@ -685,11 +752,15 @@ export function connectChatRun(requestedProfile?: string | null, transport: Chat
     // Tool events
     chatRunSocket.on('tool.started', globalToolStartedHandler)
     chatRunSocket.on('tool.completed', globalToolCompletedHandler)
+    chatRunSocket.on('tool.failed', globalToolCompletedHandler)
     chatRunSocket.on('workspace.diff.completed', globalWorkspaceDiffCompletedHandler)
     chatRunSocket.on('subagent.start', globalSubagentEventHandler)
     chatRunSocket.on('subagent.tool', globalSubagentEventHandler)
     chatRunSocket.on('subagent.progress', globalSubagentEventHandler)
+    chatRunSocket.on('subagent.text', globalSubagentEventHandler)
+    chatRunSocket.on('subagent.thinking', globalSubagentEventHandler)
     chatRunSocket.on('subagent.complete', globalSubagentEventHandler)
+    chatRunSocket.on('delegation.updated', globalSubagentEventHandler)
 
     // Run lifecycle events
     chatRunSocket.on('run.started', globalRunStartedHandler)
@@ -715,6 +786,7 @@ export function connectChatRun(requestedProfile?: string | null, transport: Chat
     chatRunSocket.on('run.reattach_failed', globalRunReattachFailedHandler)
     chatRunSocket.on('session.command', globalSessionCommandHandler)
     chatRunSocket.on('session.title.updated', globalSessionTitleUpdatedHandler)
+    chatRunSocket.on('session.workspace.updated', globalSessionWorkspaceUpdatedHandler)
 
     globalListenersRegistered = true
   }
@@ -866,6 +938,10 @@ export function startRunViaSocket(
       if (closed) return
       onEvent(evt)
     },
+    onMessageInterim: (evt: RunEvent) => {
+      if (closed) return
+      onEvent(evt)
+    },
     onReasoningDelta: (evt: RunEvent) => {
       if (closed) return
       onEvent(evt)
@@ -903,6 +979,10 @@ export function startRunViaSocket(
       if (closed) return
       onEvent(evt)
       if ((evt as any).queue_remaining > 0) return
+      if ((evt.background_pending || 0) > 0) {
+        onDone()
+        return
+      }
       closed = true
       removeTerminalSocketListeners()
       onDone()
@@ -911,6 +991,10 @@ export function startRunViaSocket(
       if (closed) return
       onEvent(evt)
       if ((evt as any).queue_remaining > 0) return
+      if ((evt.background_pending || 0) > 0) {
+        onDone()
+        return
+      }
       closed = true
       removeTerminalSocketListeners()
       onDone()

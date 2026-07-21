@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { mount } from '@vue/test-utils'
+import { flushPromises, mount } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const routeMock = vi.hoisted(() => ({ name: 'hermes.chat' as string }))
@@ -55,6 +55,10 @@ vi.mock('@/components/auth/DefaultCredentialPrompt.vue', () => ({
   default: { name: 'DefaultCredentialPrompt', template: '<div />' },
 }))
 
+vi.mock('@/components/hermes/models/ProviderConfigurationPrompt.vue', () => ({
+  default: { name: 'ProviderConfigurationPrompt', template: '<div />' },
+}))
+
 vi.mock('@/components/hermes/chat/SessionSearchModal.vue', () => ({
   default: { name: 'SessionSearchModal', template: '<div />' },
 }))
@@ -99,8 +103,9 @@ describe('App web pet mounting', () => {
     delete (window as WindowWithDesktop).hermesDesktop
   })
 
-  it('mounts the web pet in the browser web app', () => {
+  it('mounts the web pet in the browser web app', async () => {
     const wrapper = mountApp()
+    await flushPromises()
 
     expect(wrapper.findComponent({ name: 'WebPet' }).exists()).toBe(true)
   })

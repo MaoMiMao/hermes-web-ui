@@ -1,24 +1,28 @@
 <script setup lang="ts">
-import { onUnmounted, computed, watch } from 'vue'
+import { computed, defineAsyncComponent, onUnmounted, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { darkTheme, NConfigProvider, NMessageProvider, NDialogProvider, NNotificationProvider } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import { getThemeOverrides } from '@/styles/theme'
 import { useTheme } from '@/composables/useTheme'
-import AppSidebar from '@/components/layout/AppSidebar.vue'
-import DesktopTitleBar from '@/components/layout/DesktopTitleBar.vue'
 import { useKeyboard } from '@/composables/useKeyboard'
+import { useSessionSearch } from '@/composables/useSessionSearch'
 import { useAppStore } from '@/stores/hermes/app'
-import SessionSearchModal from '@/components/hermes/chat/SessionSearchModal.vue'
 import AuthEventListener from '@/components/auth/AuthEventListener.vue'
-import DefaultCredentialPrompt from '@/components/auth/DefaultCredentialPrompt.vue'
-import WebPet from '@/components/hermes/pets/WebPet.vue'
 import { desktopBridge } from '@/utils/desktop-bridge'
+
+const AppSidebar = defineAsyncComponent(async () => (await import('@/components/layout/AppSidebar.vue')).default)
+const DesktopTitleBar = defineAsyncComponent(async () => (await import('@/components/layout/DesktopTitleBar.vue')).default)
+const SessionSearchModal = defineAsyncComponent(async () => (await import('@/components/hermes/chat/SessionSearchModal.vue')).default)
+const DefaultCredentialPrompt = defineAsyncComponent(async () => (await import('@/components/auth/DefaultCredentialPrompt.vue')).default)
+const ProviderConfigurationPrompt = defineAsyncComponent(async () => (await import('@/components/hermes/models/ProviderConfigurationPrompt.vue')).default)
+const WebPet = defineAsyncComponent(async () => (await import('@/components/hermes/pets/WebPet.vue')).default)
 
 const { isDark, isComic } = useTheme()
 const { t } = useI18n()
 const appStore = useAppStore()
 const route = useRoute()
+const { sessionSearchOpen } = useSessionSearch()
 
 const themeOverrides = computed(() => getThemeOverrides(isDark.value, isComic.value))
 const naiveTheme = computed(() => isDark.value ? darkTheme : null)
@@ -88,14 +92,15 @@ useKeyboard()
               </button>
               <div v-if="!isLoginPage && showAppSidebar && appStore.sidebarOpen" class="mobile-backdrop" @click="appStore.closeSidebar" />
               <AppSidebar v-if="!isLoginPage && showAppSidebar" />
-              <main class="app-main">
+              <main class="app-main" :class="{ 'app-main--card': showAppSidebar }">
                 <router-view />
               </main>
             </div>
           </div>
           <WebPet v-if="showWebPet" />
-          <SessionSearchModal v-if="!isDesktopPetRoute" />
+          <SessionSearchModal v-if="!isDesktopPetRoute && sessionSearchOpen" />
           <DefaultCredentialPrompt v-if="!isDesktopPetRoute" />
+          <ProviderConfigurationPrompt v-if="!isDesktopPetRoute" />
         </NNotificationProvider>
       </NDialogProvider>
     </NMessageProvider>
@@ -122,6 +127,7 @@ useKeyboard()
   width: 100%;
   max-width: 100%;
   overflow: hidden;
+  background-color: $bg-card;
 
   &.no-sidebar {
     display: block;
@@ -140,6 +146,34 @@ useKeyboard()
 
   .no-sidebar & {
     height: 100%;
+  }
+
+  &--card {
+    margin: 10px 10px 10px 0;
+    background-color: $bg-main-surface;
+    border: 1px solid $border-color;
+    border-radius: 14px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1);
+  }
+}
+
+@media (min-width: 769px) {
+  .app-main--card {
+    overflow: hidden;
+
+    :deep(> *) {
+      height: 100% !important;
+      max-height: 100%;
+    }
+  }
+}
+
+@media (max-width: $breakpoint-mobile) {
+  .app-main--card {
+    margin: 0;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
   }
 }
 

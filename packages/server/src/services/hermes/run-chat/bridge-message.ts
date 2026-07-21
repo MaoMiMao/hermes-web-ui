@@ -7,15 +7,13 @@ import { addMessage } from '../../../db/hermes/session-store'
 import { logger } from '../../logger'
 import type { SessionMessage, SessionState } from './types'
 
-export function flushBridgePendingToDb(state: SessionState, sessionId: string, runMarker?: string) {
+export function flushBridgePendingToDb(state: SessionState, sessionId: string, runMarker?: string): string | undefined {
   const content = state.bridgePendingAssistantContent || ''
   const reasoning = state.bridgePendingReasoningContent || ''
-  if (!content.trim()) return
-  if (runMarker) {
-    const last = findOpenBridgeAssistantMessage(state, runMarker)
-    if (last) syncBridgeReasoningToMessage(last, reasoning)
-  }
-  addMessage({
+  if (!content.trim()) return state.bridgeAssistantMessageId
+  const assistantMessage = runMarker ? findOpenBridgeAssistantMessage(state, runMarker) : undefined
+  if (assistantMessage) syncBridgeReasoningToMessage(assistantMessage, reasoning)
+  const persistedId = addMessage({
     session_id: sessionId,
     role: 'assistant',
     content,
@@ -25,10 +23,12 @@ export function flushBridgePendingToDb(state: SessionState, sessionId: string, r
   })
   state.bridgePendingAssistantContent = ''
   state.bridgePendingReasoningContent = ''
-  if (runMarker) {
-    const last = findOpenBridgeAssistantMessage(state, runMarker)
-    if (last && last.finish_reason == null) last.finish_reason = 'stop'
+  if (persistedId != null) {
+    state.bridgeAssistantMessageId = String(persistedId)
+    if (assistantMessage) assistantMessage.id = persistedId
   }
+  if (assistantMessage && assistantMessage.finish_reason == null) assistantMessage.finish_reason = 'stop'
+  return state.bridgeAssistantMessageId
 }
 
 export function findOpenBridgeAssistantMessage(state: SessionState, runMarker: string): SessionMessage | undefined {

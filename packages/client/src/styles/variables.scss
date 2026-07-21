@@ -12,6 +12,8 @@
   --bg-card: #ffffff;
   --bg-card-hover: #fafafa;
   --bg-input: #ffffff;
+  --bg-sidebar-surface: var(--bg-card);
+  --bg-main-surface: var(--bg-card);
 
   // Borders
   --border-color: #e0e0e0;
@@ -61,9 +63,11 @@
   --bg-primary: #1a1a1a;
   --bg-secondary: #252525;
   --bg-sidebar: #202020;
-  --bg-card: #333333;
+  --bg-card: #2a2a2a;
   --bg-card-hover: #333333;
   --bg-input: #2a2a2a;
+  --bg-sidebar-surface: var(--bg-primary);
+  --bg-main-surface: var(--bg-primary);
 
   // Borders
   --border-color: #3a3a3a;
@@ -75,8 +79,8 @@
   --accent-muted: #888888;
 
   // Text
-  --text-primary: #f0f0f0;
-  --text-secondary: #c0c0c0;
+  --text-primary: #e0e0e0;
+  --text-secondary: #a0a0a0;
   --text-muted: #888888;
 
   // Status
@@ -85,8 +89,8 @@
   --warning: #ffb74d;
 
   // Message bubbles
-  --msg-user-bg: #252525;
-  --msg-assistant-bg: #252525;
+  --msg-user-bg: #292929;
+  --msg-assistant-bg: #292929;
   --msg-system-border: #555555;
 
   // Code
@@ -98,9 +102,9 @@
   --accent-info: #6ba3d6;
 
   // RGB components
-  --accent-primary-rgb: 240, 240, 240;
+  --accent-primary-rgb: 224, 224, 224;
   --accent-hover-rgb: 245, 245, 245;
-  --text-primary-rgb: 240, 240, 240;
+  --text-primary-rgb: 224, 224, 224;
   --text-muted-rgb: 136, 136, 136;
   --success-rgb: 102, 187, 106;
   --error-rgb: 239, 83, 80;
@@ -138,6 +142,8 @@ $bg-sidebar: var(--bg-sidebar);
 $bg-card: var(--bg-card);
 $bg-card-hover: var(--bg-card-hover);
 $bg-input: var(--bg-input);
+$bg-sidebar-surface: var(--bg-sidebar-surface);
+$bg-main-surface: var(--bg-main-surface);
 
 // Borders
 $border-color: var(--border-color);
@@ -179,8 +185,8 @@ $breakpoint-mobile: 768px;
 
 // Radius
 $radius-sm: 6px;
-$radius-md: 10px;
-$radius-lg: 14px;
+$radius-md: 8px;
+$radius-lg: 8px;
 
 // Transition
 $transition-fast: 0.15s ease;

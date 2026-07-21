@@ -68,6 +68,32 @@ describe('group chat mention routing', () => {
     expect(resolveMentionTargets(agents, '@alligator and @Bob compare plans', 'socket-alice').map(a => a.name)).toEqual(['Bob'])
   })
 
+  it('handles prefix collisions and special-character agent names', () => {
+    const specialAgents: TestAgent[] = [
+      { name: 'Bob', id: 'socket-bob', agentId: 'agent-bob' },
+      { name: 'Bobcat', id: 'socket-bobcat', agentId: 'agent-bobcat' },
+      { name: 'C++', id: 'socket-cpp', agentId: 'agent-cpp' },
+    ]
+
+    expect(resolveMentionTargets(specialAgents, '@Bobcat inspect', 'human-1').map(a => a.name)).toEqual(['Bobcat'])
+    expect(resolveMentionTargets(specialAgents, '@Bob inspect', 'human-1').map(a => a.name)).toEqual(['Bob'])
+    expect(resolveMentionTargets(specialAgents, '@C++: inspect', 'human-1').map(a => a.name)).toEqual(['C++'])
+  })
+
+  it('ignores mentions inside a quoted message while preserving them as context', () => {
+    const content = [
+      '<quoted_message sender="Alice">',
+      '@Bob please review this',
+      '</quoted_message>',
+      '',
+      '@Regex.Bot what do you think?',
+    ].join('\n')
+
+    expect(resolveMentionTargets(agents, content, 'socket-alice').map(agent => agent.name)).toEqual(['Regex.Bot'])
+    expect(stripMentionRoutingTokens(content, 'Regex.Bot')).toContain('@Bob please review this')
+    expect(stripMentionRoutingTokens(content, 'Regex.Bot')).not.toContain('@Regex.Bot')
+  })
+
   it('dedupes mixed @all and explicit mentions', () => {
     expect(resolveMentionTargets(agents, '@all @Bob compare plans', 'socket-alice').map(a => a.name)).toEqual(['Bob', 'Regex.Bot'])
   })

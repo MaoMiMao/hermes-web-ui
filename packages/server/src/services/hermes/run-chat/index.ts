@@ -10,19 +10,25 @@
 import type { Server, Socket } from 'socket.io'
 import { logger } from '../../logger'
 import { getSystemPrompt } from '../../../lib/llm-prompt'
-import { clearSessionMessages, getSession, getSessionDetail  } from '../../../db/hermes/session-store'
+import { clearSessionMessages, getSession, getSessionMetadata, listSessions } from '../../../db/hermes/session-store'
+import { getSessionCategory } from '../../../db/hermes/session-category-store'
 import { getActiveProfileName, getProfileDir, listProfileNamesFromDisk } from '../hermes-profile'
-import { AgentBridgeClient } from '../agent-bridge'
+import {
+  AgentBridgeClient,
+  type AgentBridgeBackgroundNotification,
+  type AgentBridgeBackgroundSession,
+} from '../agent-bridge'
 import { getAgentBridgeManager } from '../agent-bridge/manager'
 import { redactAgentBridgeError } from '../agent-bridge/redact'
 import { handleBridgeRun, resumeBridgeRun } from './handle-bridge-run'
 import { handleCodingAgentRun } from './handle-coding-agent-run'
+import { handleEkkoAgentRun } from './handle-ekko-agent-run'
 import { handleAbort } from './abort'
 import { getOrCreateSession } from './compression'
 import { loadSessionStateFromDb, resolveRunSource } from './load-state'
 import { handleSessionCommand, isSessionCommand, parseSessionCommand } from './session-command'
 import { contentBlocksToString } from './content-blocks'
-import type { ContentBlock, QueuedRun, SessionState } from './types'
+import type { ChatCodingAgentId, ContentBlock, QueuedRun, SessionState } from './types'
 import { authenticateUserToken, isAuthEnabled, type AuthenticatedUser } from '../../../middleware/user-auth'
 import { userCanAccessProfile } from '../../../db/hermes/users-store'
 import { observeRunChatPetEvent } from '../pet-state-socket'
@@ -53,11 +59,11 @@ function isHermesWorkerBackedSession(session?: { source?: string | null; agent?:
   if (!source || source === 'cli' || source === 'api_server') return true
   if (source === 'workflow') {
     const agent = String(session?.agent || '').trim()
-    return agent !== 'claude' && agent !== 'codex' && !session?.agent_session_id
+    return agent !== 'claude' && agent !== 'codex' && agent !== 'ekko-agent' && !session?.agent_session_id
   }
   if (source !== 'global_agent') return false
   const agent = String(session?.agent || '').trim()
-  return agent !== 'claude' && agent !== 'codex' && !session?.agent_session_id
+  return agent !== 'claude' && agent !== 'codex' && agent !== 'ekko-agent' && !session?.agent_session_id
 }
 
 function isBridgeRunSource(source?: string): boolean {
@@ -86,6 +92,16 @@ function isCodingAgentExecution(source: string | undefined, data?: { coding_agen
   return source === 'coding_agent' || (source === 'workflow' && Boolean(data?.coding_agent_id || data?.agent_id))
 }
 
+function resolveSessionCategoryId(value: unknown): number | null {
+  const categoryId = Number(value)
+  if (!Number.isSafeInteger(categoryId) || categoryId <= 0) return null
+  return getSessionCategory(categoryId) ? categoryId : null
+}
+
+function isEkkoAgentExecution(data?: { coding_agent_id?: string; agent_id?: string }): boolean {
+  return data?.coding_agent_id === 'ekko-agent' || data?.agent_id === 'ekko-agent'
+}
+
 export interface ChatRunAndWaitResult {
   ok: boolean
   event: 'run.completed' | 'run.failed'
@@ -101,18 +117,30 @@ type ChatRunAutoApprovalChoice = 'once' | 'session' | 'always'
 export class ChatRunSocket {
   private nsp: ReturnType<Server['of']>
   private bridge = new AgentBridgeClient()
+  private backgroundBridge = new AgentBridgeClient({ timeoutMs: 1000, connectRetryMs: 0 })
   /** sessionId → session state (messages, working status, events, run tracking) */
   private sessionMap = new Map<string, SessionState>()
   private bridgeResumePolls = new Set<string>()
   private readonly runWaiters = new Map<string, Set<(event: string, payload: any) => void>>()
+  private backgroundPollTimer?: NodeJS.Timeout
+  private backgroundPollInFlight = false
+  private backgroundRecoveryNeeded = true
+  private backgroundBrokerId?: string
+  private backgroundPollRetryAt = 0
+  private backgroundActivityGraceUntil = 0
+  private closing = false
 
   constructor(io: Server) {
     this.nsp = io.of('/chat-run')
   }
 
   init() {
+    this.closing = false
     this.nsp.use(this.authMiddleware.bind(this))
     this.nsp.on('connection', this.onConnection.bind(this))
+    this.backgroundPollTimer = setInterval(() => void this.pollBackgroundWork(), 500)
+    this.backgroundPollTimer.unref?.()
+    void this.pollBackgroundWork()
     logger.info('[chat-run-socket] Socket.IO ready at /chat-run')
   }
 
@@ -183,10 +211,11 @@ export class ChatRunSocket {
       model_groups?: Array<{ provider: string; models: string[] }>
       queue_id?: string
       workspace?: string | null
+      category_id?: number | null
       source?: string
       session_source?: 'global_agent' | 'workflow'
-      coding_agent_id?: 'claude-code' | 'codex'
-      agent_id?: 'claude-code' | 'codex'
+      coding_agent_id?: ChatCodingAgentId
+      agent_id?: ChatCodingAgentId
       mode?: 'scoped' | 'global'
       baseUrl?: string
       base_url?: string
@@ -194,6 +223,8 @@ export class ChatRunSocket {
       api_key?: string
       apiMode?: string
       api_mode?: string
+      mcpServers?: Record<string, unknown>
+      mcp_servers?: Record<string, unknown>
       profile?: string
       allow_command_passthrough?: boolean
       // Local patch (reasoning-effort): per-session reasoning effort override.
@@ -209,6 +240,9 @@ export class ChatRunSocket {
           error: err instanceof Error ? err.message : String(err),
         })
         return
+      }
+      if (data.category_id !== undefined) {
+        data.category_id = resolveSessionCategoryId(data.category_id)
       }
       if (data.session_id) {
         const state = getOrCreateSession(this.sessionMap, data.session_id)
@@ -264,7 +298,10 @@ export class ChatRunSocket {
             api_key: data.api_key,
             apiMode: data.apiMode,
             api_mode: data.api_mode,
+            mcpServers: data.mcpServers,
+            mcp_servers: data.mcp_servers,
             commandPassthrough: data.allow_command_passthrough,
+            reasoningEffort: data.reasoning_effort,
             originSocketId: socket.id,
           })
           this.nsp.to(`session:${data.session_id}`).emit('run.queued', {
@@ -386,12 +423,13 @@ export class ChatRunSocket {
       model_groups?: Array<{ provider: string; models: string[] }>
       instructions?: string
       workspace?: string | null
+      category_id?: number | null
       source?: string
       session_source?: 'global_agent' | 'workflow'
       queue_id?: string
       peerExcludeSocketId?: string
-      coding_agent_id?: 'claude-code' | 'codex'
-      agent_id?: 'claude-code' | 'codex'
+      coding_agent_id?: ChatCodingAgentId
+      agent_id?: ChatCodingAgentId
       mode?: 'scoped' | 'global'
       baseUrl?: string
       base_url?: string
@@ -399,8 +437,15 @@ export class ChatRunSocket {
       api_key?: string
       apiMode?: string
       api_mode?: string
+      mcpServers?: Record<string, unknown>
+      mcp_servers?: Record<string, unknown>
       one_shot_model?: boolean
       allow_command_passthrough?: boolean
+      reasoning_effort?: string
+      background_delegation_enabled?: boolean
+      background_delegation_id?: string
+      background_claim_id?: string
+      autonomous?: boolean
       onEvent?: (event: string, payload: any) => void
     },
     profile: string,
@@ -443,6 +488,14 @@ export class ChatRunSocket {
         }
         if (queueRemaining > 0) payload.queue_remaining = queueRemaining
         socket.emit('run.failed', payload)
+        if (data.session_id && data.background_delegation_id && data.background_claim_id) {
+          void this.bridge.releaseBackgroundNotification(
+            data.session_id,
+            profile,
+            data.background_delegation_id,
+            data.background_claim_id,
+          ).catch(err => logger.warn(err, '[chat-run-socket] failed to release undelivered background notification'))
+        }
         if (data.session_id && shouldDequeueNext) {
           this.dequeueNextQueuedRun(socket, data.session_id, profile)
         }
@@ -463,6 +516,19 @@ export class ChatRunSocket {
       return
     }
 
+    if (isEkkoAgentExecution(data)) {
+      await handleEkkoAgentRun(
+        this.nsp,
+        socket,
+        data,
+        profile,
+        this.sessionMap,
+        this.dequeueNextQueuedRun.bind(this),
+        skipUserMessage,
+      )
+      return
+    }
+
     await handleCodingAgentRun(
       this.nsp,
       socket,
@@ -470,6 +536,214 @@ export class ChatRunSocket {
       profile,
       this.sessionMap,
     )
+  }
+
+  private backgroundPendingCount(state: SessionState): number {
+    const delegations = Object.values(state.backgroundDelegations || {})
+      .filter(item => item.status === 'running' || item.status === 'delivering')
+      .length
+    if (delegations > 0) return delegations
+    return Object.values(state.backgroundTasks || {})
+      .filter(task => task.status === 'running')
+      .length
+  }
+
+  private async sessionStateForBackground(sessionId: string): Promise<SessionState | null> {
+    const existing = this.sessionMap.get(sessionId)
+    if (existing) return existing
+    if (!getSession(sessionId)) return null
+    const loaded = await loadSessionStateFromDb(sessionId, this.sessionMap)
+    this.sessionMap.set(sessionId, loaded)
+    return loaded
+  }
+
+  private applyBackgroundSessionPoll(poll: AgentBridgeBackgroundSession, state: SessionState) {
+    if ((poll.events?.length || 0) > 0 || poll.running_count > 0) {
+      this.backgroundActivityGraceUntil = Date.now() + 30_000
+    }
+    state.backgroundTasks = state.backgroundTasks || {}
+    for (const task of poll.tasks || []) {
+      const subagentId = String(task.subagent_id || '').trim()
+      if (subagentId) state.backgroundTasks[subagentId] = { ...task }
+    }
+    for (const rawEvent of poll.events || []) {
+      const event = String(rawEvent.event || '')
+      if (!event.startsWith('subagent.')) continue
+      this.emitExternalEvent(poll.session_id, event, {
+        ...rawEvent,
+        event,
+        profile: poll.profile,
+        background: true,
+      })
+    }
+  }
+
+  private socketForBackgroundRun(sessionId: string): Socket {
+    const room = this.nsp.adapter.rooms.get(`session:${sessionId}`)
+    if (room) {
+      for (const socketId of room) {
+        const socket = this.nsp.sockets.get(socketId)
+        if (socket) return socket
+      }
+    }
+    return {
+      id: `background-run-${sessionId}`,
+      connected: false,
+      data: {},
+      join: () => {},
+      emit: (event: string, payload: any) => this.nsp.to(`session:${sessionId}`).emit(event, payload),
+      to: (roomName: string) => ({
+        emit: (event: string, payload: any) => this.nsp.to(roomName).emit(event, payload),
+      }),
+    } as unknown as Socket
+  }
+
+  private async scheduleBackgroundNotification(notification: AgentBridgeBackgroundNotification) {
+    const sessionId = String(notification.session_id || '').trim()
+    const delegationId = String(notification.delegation_id || '').trim()
+    const claimId = String(notification.claim_id || '').trim()
+    if (!sessionId || !delegationId || !claimId || !notification.message) return
+
+    const releaseClaim = () => this.backgroundBridge.releaseBackgroundNotification(
+      sessionId,
+      notification.profile,
+      delegationId,
+      claimId,
+    )
+    if (this.closing) {
+      await releaseClaim()
+      return
+    }
+
+    const session = getSession(sessionId)
+    if (!session) {
+      logger.warn('[chat-run-socket] acknowledging orphaned background delegation %s for missing session %s', delegationId, sessionId)
+      await this.backgroundBridge.completeBackgroundNotification(
+        sessionId,
+        notification.profile,
+        delegationId,
+        claimId,
+      )
+      return
+    }
+
+    const state = await this.sessionStateForBackground(sessionId)
+    if (!state) {
+      await releaseClaim()
+      return
+    }
+    if (this.closing) {
+      await releaseClaim()
+      return
+    }
+    state.backgroundDelegations = state.backgroundDelegations || {}
+    state.backgroundDelegations[delegationId] = {
+      delegationId,
+      status: 'delivering',
+      profile: notification.profile,
+      updatedAt: Date.now(),
+    }
+    this.emitExternalEvent(sessionId, 'delegation.updated', {
+      event: 'delegation.updated',
+      profile: notification.profile,
+      delegation_id: delegationId,
+      status: notification.status || 'completed',
+      delivery_status: 'delivering',
+      background_pending: this.backgroundPendingCount(state),
+    })
+
+    const next: QueuedRun = {
+      queue_id: `delegation_${delegationId}`,
+      input: notification.message,
+      displayInput: null,
+      storageMessage: notification.message,
+      model: session.model || undefined,
+      provider: session.provider || undefined,
+      profile: notification.profile || session.profile || 'default',
+      workspace: session.workspace,
+      source: resolveRunSource(session.source || undefined, sessionId),
+      backgroundDelegationId: delegationId,
+      backgroundClaimId: claimId,
+      autonomous: true,
+    }
+
+    if (state.isWorking) {
+      state.queue.push(next)
+      logger.info('[chat-run-socket] queued background delegation %s for busy session %s', delegationId, sessionId)
+      return
+    }
+
+    state.isWorking = true
+    state.profile = next.profile
+    state.source = next.source
+    this.runQueuedItem(this.socketForBackgroundRun(sessionId), sessionId, next, next.profile)
+  }
+
+  private needsBackgroundPoll(): boolean {
+    if (this.closing) return false
+    if (this.backgroundRecoveryNeeded) return true
+    if (Date.now() < this.backgroundActivityGraceUntil) return true
+    for (const state of this.sessionMap.values()) {
+      if (this.backgroundPendingCount(state) > 0) return true
+      if (Object.values(state.backgroundTasks || {}).some(task => task.status === 'running')) return true
+    }
+    return false
+  }
+
+  private backgroundRecoveryRoutes() {
+    const cutoff = Math.floor(Date.now() / 1000) - 8 * 24 * 60 * 60
+    const sessionsByProfile = new Map<string, string[]>()
+    for (const session of listSessions(undefined, undefined, 10_000)) {
+      if (session.last_active < cutoff) continue
+      if (!isHermesWorkerBackedSession(session)) continue
+      const profile = session.profile || 'default'
+      const ids = sessionsByProfile.get(profile) || []
+      ids.push(session.id)
+      sessionsByProfile.set(profile, ids)
+    }
+    return [...sessionsByProfile.entries()].map(([profile, session_ids]) => ({ profile, session_ids }))
+  }
+
+  private async pollBackgroundWork() {
+    if (this.closing || this.backgroundPollInFlight || Date.now() < this.backgroundPollRetryAt || !this.needsBackgroundPoll()) return
+    this.backgroundPollInFlight = true
+    try {
+      const recovering = this.backgroundRecoveryNeeded
+      const routes = recovering ? this.backgroundRecoveryRoutes() : undefined
+      const result = await this.backgroundBridge.backgroundPoll(routes, { timeoutMs: recovering ? 120_000 : 1000 })
+      if (this.closing) {
+        await Promise.allSettled((result.notifications || []).map(notification => (
+          this.backgroundBridge.releaseBackgroundNotification(
+            notification.session_id,
+            notification.profile,
+            notification.delegation_id,
+            notification.claim_id,
+          )
+        )))
+        return
+      }
+      const brokerChanged = Boolean(this.backgroundBrokerId && result.broker_id && result.broker_id !== this.backgroundBrokerId)
+      if (result.broker_id) this.backgroundBrokerId = result.broker_id
+      this.backgroundRecoveryNeeded = brokerChanged && !recovering
+      this.backgroundPollRetryAt = 0
+      if ((result.pending_count || 0) > 0) {
+        this.backgroundActivityGraceUntil = Date.now() + 310_000
+      }
+      for (const poll of result.sessions || []) {
+        const sessionId = String(poll.session_id || '').trim()
+        if (!sessionId) continue
+        const state = await this.sessionStateForBackground(sessionId)
+        if (state) this.applyBackgroundSessionPoll(poll, state)
+      }
+      for (const notification of result.notifications || []) {
+        await this.scheduleBackgroundNotification(notification)
+      }
+    } catch (err) {
+      this.backgroundPollRetryAt = Date.now() + 5000
+      logger.debug(err, '[chat-run-socket] background bridge poll unavailable')
+    } finally {
+      this.backgroundPollInFlight = false
+    }
   }
 
   // --- Resume ---
@@ -484,7 +758,7 @@ export class ChatRunSocket {
     const resumeEvents = state.isWorking
       ? state.events
       : (state.events || []).filter(evt => evt?.event === 'run.reattach_failed')
-    const sessionDetail = getSessionDetail(sid)
+    const sessionDetail = getSessionMetadata(sid)
     socket.emit('resumed', {
       session_id: sid,
       messages: state.messages,
@@ -497,6 +771,7 @@ export class ChatRunSocket {
       parentTitle: sessionDetail?.parent_title || null,
       parentLastMessage: sessionDetail?.parent_last_message || null,
       parentLastMessageRole: sessionDetail?.parent_last_message_role || null,
+      workspace: sessionDetail?.workspace || null,
       isWorking: state.isWorking,
       isAborting: state.isAborting || false,
       events: resumeEvents,
@@ -505,6 +780,8 @@ export class ChatRunSocket {
       contextTokens: state.contextTokens,
       queueLength: state.queue?.length || 0,
       queueMessages: this.serializeQueuedMessages(state.queue || []),
+      backgroundTasks: Object.values(state.backgroundTasks || {}),
+      backgroundPending: this.backgroundPendingCount(state),
     })
 
     logger.info('[chat-run-socket] socket %s resumed session %s (working: %s, messages: %d)',
@@ -531,7 +808,11 @@ export class ChatRunSocket {
       state.runId = runId
       state.activeRunMarker = undefined
       state.profile = profile
-      state.source = source === 'global_agent' ? 'global_agent' : 'cli'
+      state.source = source === 'global_agent'
+        ? 'global_agent'
+        : source === 'workflow'
+          ? 'workflow'
+          : 'cli'
       state.events = []
       const instructions = this.resumeInstructionsForSession(sid)
       void resumeBridgeRun(
@@ -633,8 +914,14 @@ export class ChatRunSocket {
       api_key: next.api_key,
       apiMode: next.apiMode,
       api_mode: next.api_mode,
+      mcpServers: next.mcpServers,
+      mcp_servers: next.mcp_servers,
       one_shot_model: next.oneShotModel,
       allow_command_passthrough: next.commandPassthrough,
+      reasoning_effort: next.reasoningEffort,
+      background_delegation_id: next.backgroundDelegationId,
+      background_claim_id: next.backgroundClaimId,
+      autonomous: next.autonomous,
     }, next.profile || fallbackProfile, skipUserMessage)
   }
 
@@ -655,8 +942,8 @@ export class ChatRunSocket {
       source?: string
       session_source?: 'global_agent' | 'workflow'
       queue_id?: string
-      coding_agent_id?: 'claude-code' | 'codex'
-      agent_id?: 'claude-code' | 'codex'
+      coding_agent_id?: ChatCodingAgentId
+      agent_id?: ChatCodingAgentId
       mode?: 'scoped' | 'global'
       baseUrl?: string
       base_url?: string
@@ -664,8 +951,13 @@ export class ChatRunSocket {
       api_key?: string
       apiMode?: string
       api_mode?: string
+      mcpServers?: Record<string, unknown>
+      mcp_servers?: Record<string, unknown>
       profile?: string
       reasoning_effort?: string
+      /** Hermes Agent creation policy used by internal orchestration callers. */
+      background_delegation_enabled?: boolean
+      one_shot_model?: boolean
     },
     options: { profile?: string; user?: AuthenticatedUser; timeoutMs?: number; approvalChoice?: ChatRunAutoApprovalChoice } = {},
   ): Promise<ChatRunAndWaitResult> {
@@ -765,7 +1057,11 @@ export class ChatRunSocket {
       }
       const timer = timeoutMs
         ? setTimeout(() => {
-            finish({ ok: false, event: 'run.failed', error: `chat-run timed out after ${timeoutMs}ms` })
+            const error = `chat-run timed out after ${timeoutMs}ms`
+            finish({ ok: false, event: 'run.failed', error })
+            void this.abortSession(sessionId, error).catch(err => {
+              logger.warn(err, '[chat-run-socket] failed to abort timed-out session %s', sessionId)
+            })
           }, timeoutMs)
         : null
       waiters.add(onEvent)
@@ -974,7 +1270,14 @@ export class ChatRunSocket {
   }
 
   /** Close all active upstream response streams */
-  close() {
+  async close() {
+    if (this.closing) return
+    this.closing = true
+    if (this.backgroundPollTimer) {
+      clearInterval(this.backgroundPollTimer)
+      this.backgroundPollTimer = undefined
+    }
+    const releaseClaims: Array<Promise<unknown>> = []
     for (const [sessionId, state] of this.sessionMap.entries()) {
       if (state.abortController) {
         try {
@@ -983,8 +1286,24 @@ export class ChatRunSocket {
           logger.warn(e, '[chat-run-socket] failed to abort controller for session %s', sessionId)
         }
       }
+      for (const queued of state.queue) {
+        if (!queued.backgroundDelegationId || !queued.backgroundClaimId) continue
+        releaseClaims.push(this.backgroundBridge.releaseBackgroundNotification(
+          sessionId,
+          queued.profile,
+          queued.backgroundDelegationId,
+          queued.backgroundClaimId,
+        ))
+      }
     }
     this.sessionMap.clear()
+    const releaseResults = await Promise.allSettled(releaseClaims)
+    for (const result of releaseResults) {
+      if (result.status === 'rejected') {
+        logger.warn(result.reason, '[chat-run-socket] failed to release queued background notification on close')
+      }
+    }
+    await Promise.allSettled([this.bridge.close(), this.backgroundBridge.close()])
     logger.info('[chat-run-socket] closed all connections and cleared state')
   }
 

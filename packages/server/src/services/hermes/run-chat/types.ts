@@ -41,8 +41,8 @@ export interface QueuedRun {
   workspace?: string | null
   source?: ChatRunSource
   sessionSource?: 'global_agent' | 'workflow'
-  codingAgentId?: 'claude-code' | 'codex'
-  agentId?: 'claude-code' | 'codex'
+  codingAgentId?: ChatCodingAgentId
+  agentId?: ChatCodingAgentId
   mode?: 'scoped' | 'global'
   baseUrl?: string
   base_url?: string
@@ -50,10 +50,23 @@ export interface QueuedRun {
   api_key?: string
   apiMode?: string
   api_mode?: string
+  mcpServers?: Record<string, unknown>
+  mcp_servers?: Record<string, unknown>
   oneShotModel?: boolean
   commandPassthrough?: boolean
   originSocketId?: string
   goalContinuation?: boolean
+  reasoningEffort?: string
+  backgroundDelegationId?: string
+  backgroundClaimId?: string
+  autonomous?: boolean
+}
+
+export interface BackgroundDelegationState {
+  delegationId: string
+  status: 'running' | 'delivering' | 'completed' | 'failed' | 'interrupted'
+  profile?: string
+  updatedAt: number
 }
 
 export interface SessionState {
@@ -77,6 +90,7 @@ export interface SessionState {
   responseRun?: ResponseRunState
   source?: ChatRunSource
   bridgePendingAssistantContent?: string
+  bridgeAssistantMessageId?: string
   bridgePendingReasoningContent?: string
   bridgePendingToolCallMarkup?: string
   bridgeOutput?: string
@@ -88,6 +102,8 @@ export interface SessionState {
     startedAt: number
   }>
   bridgeCompressionResults?: Record<string, BridgeCompressionResult>
+  backgroundTasks?: Record<string, Record<string, unknown>>
+  backgroundDelegations?: Record<string, BackgroundDelegationState>
 }
 
 export interface ResponseRunState {
@@ -113,6 +129,7 @@ export interface BridgeContextState {
 }
 
 export type ChatRunSource = 'api_server' | 'cli' | 'coding_agent' | 'global_agent' | 'workflow'
+export type ChatCodingAgentId = 'claude-code' | 'codex' | 'ekko-agent'
 
 export interface BridgeCompressionResult {
   messages: ChatMessage[]

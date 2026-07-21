@@ -1,7 +1,7 @@
-import { startRunViaSocket, resumeSession, registerSessionHandlers, unregisterSessionHandlers, getChatRunSocket, respondToolApproval, onPeerUserMessage, onSessionCommand, onSessionTitleUpdated, respondClarify, type ChatRunTransport, type RunEvent, type ResumeSessionPayload, type StartRunRequest, type ContentBlock as ContentBlockImport } from '@/api/hermes/chat'
+import { startRunViaSocket, resumeSession, registerSessionHandlers, unregisterSessionHandlers, getChatRunSocket, respondToolApproval, onPeerUserMessage, onSessionCommand, onSessionTitleUpdated, onSessionWorkspaceUpdated, respondClarify, type ChatRunTransport, type RunEvent, type ResumeSessionPayload, type StartRunRequest, type ContentBlock as ContentBlockImport } from '@/api/hermes/chat'
 import { archiveSession as archiveSessionApi, deleteSession as deleteSessionApi, fetchSessionMessagesPage, fetchSessions, fetchWorkspaceRunChangeFile, fetchWorkspaceRunChangesForSession, setSessionModel, type HermesMessage, type SessionSummary, type WorkspaceRunChangeFileDetail, type WorkspaceRunChangeSummary } from '@/api/hermes/sessions'
 import { getActiveProfileName } from '@/api/client'
-import { inferCodingAgentApiMode, normalizeCodingAgentApiMode } from '@/api/coding-agents'
+import { inferCodingAgentApiMode, normalizeCodingAgentApiMode, type ChatCodingAgentId } from '@/api/coding-agents'
 import { getDownloadUrl } from '@/api/hermes/download'
 import type { ProviderApiMode } from '@/api/hermes/system'
 import { defineStore } from 'pinia'
@@ -21,6 +21,21 @@ export type ContentBlock = ContentBlockImport
 export const LIVE_CHAT_MESSAGE_PAGE_SIZE = 150
 export const LIVE_CHAT_MAX_LOADED_MESSAGES = 300
 const WORKSPACE_RUN_CHANGE_MESSAGE_PREFIX = 'workspace-run-change:'
+type ChatAgentId = 'hermes' | 'claude' | 'codex' | 'ekko-agent'
+
+function agentToCodingAgentId(agent?: string): ChatCodingAgentId | undefined {
+  if (agent === 'codex') return 'codex'
+  if (agent === 'claude') return 'claude-code'
+  if (agent === 'ekko-agent') return 'ekko-agent'
+  return undefined
+}
+
+function codingAgentIdToAgent(id?: ChatCodingAgentId): ChatAgentId | undefined {
+  if (id === 'codex') return 'codex'
+  if (id === 'claude-code') return 'claude'
+  if (id === 'ekko-agent') return 'ekko-agent'
+  return undefined
+}
 
 function moaReferenceLabel(evt: RunEvent): string {
   const label = typeof evt.label === 'string' && evt.label.trim()
@@ -55,6 +70,7 @@ export interface Message {
   toolStatus?: 'running' | 'done' | 'error'
   toolDuration?: number  // 工具执行时长（秒）
   toolChange?: WorkspaceRunChangeSummary
+  workspaceChanges?: WorkspaceRunChangeSummary[]
   isStreaming?: boolean
   attachments?: Attachment[]
   // 思考/推理文本。两条来源：
@@ -68,6 +84,258 @@ export interface Message {
   commandData?: Record<string, unknown>
   finishReason?: string | null
   runMarker?: string | null
+}
+
+export type SubagentStreamStatus =
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'error'
+  | 'cancelled'
+  | 'interrupted'
+
+export interface SubagentStreamEntry {
+  id: string
+  kind: 'text' | 'thinking' | 'tool' | 'status'
+  timestamp: number
+  text?: string
+  toolName?: string
+  toolArgs?: unknown
+  status?: SubagentStreamStatus | 'started'
+}
+
+export interface SubagentStream {
+  sessionId: string
+  subagentId: string
+  taskIndex: number
+  taskCount: number
+  goal?: string
+  model?: string
+  status: SubagentStreamStatus
+  startedAt: number
+  updatedAt: number
+  completedAt?: number
+  durationSeconds?: number
+  toolCount?: number
+  apiCalls?: number
+  inputTokens?: number
+  outputTokens?: number
+  costUsd?: number
+  summary?: string
+  lastBackgroundSeq?: number
+  entries: SubagentStreamEntry[]
+}
+
+const SUBAGENT_STREAM_ENTRY_LIMIT = 200
+const SUBAGENT_STREAM_TEXT_LIMIT = 80_000
+let subagentStreamEntrySequence = 0
+
+function subagentEventTimestamp(value: unknown): number {
+  const timestamp = Number(value)
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return Date.now()
+  return timestamp < 1_000_000_000_000 ? Math.round(timestamp * 1000) : Math.round(timestamp)
+}
+
+function subagentStatus(value: unknown, fallback: SubagentStreamStatus = 'running'): SubagentStreamStatus {
+  const status = String(value || '').trim().toLowerCase()
+  if (status === 'completed' || status === 'failed' || status === 'error' || status === 'cancelled' || status === 'interrupted') {
+    return status
+  }
+  return fallback
+}
+
+function subagentEntryId(eventName: string, evt: RunEvent): string {
+  const backgroundSequence = Number((evt as any).background_seq)
+  if (Number.isFinite(backgroundSequence)) return `${eventName}:${backgroundSequence}`
+  if ((evt as any).background_snapshot) return `snapshot:${eventName}`
+  subagentStreamEntrySequence += 1
+  return `${eventName}:${subagentStreamEntrySequence}`
+}
+
+function trimSubagentEntries(entries: SubagentStreamEntry[]): SubagentStreamEntry[] {
+  return entries.length > SUBAGENT_STREAM_ENTRY_LIMIT
+    ? entries.slice(entries.length - SUBAGENT_STREAM_ENTRY_LIMIT)
+    : entries
+}
+
+function appendSubagentText(
+  entries: SubagentStreamEntry[],
+  entry: SubagentStreamEntry,
+): SubagentStreamEntry[] {
+  const previous = entries[entries.length - 1]
+  if (previous?.kind === entry.kind && entry.text) {
+    const previousText = previous.text || ''
+    const nextText = entry.text.startsWith(previousText)
+      ? entry.text
+      : `${previousText}${entry.text}`
+    entries[entries.length - 1] = {
+      ...previous,
+      text: nextText.slice(-SUBAGENT_STREAM_TEXT_LIMIT),
+      timestamp: entry.timestamp,
+    }
+    return entries
+  }
+  entries.push({
+    ...entry,
+    text: entry.text?.slice(-SUBAGENT_STREAM_TEXT_LIMIT),
+  })
+  return trimSubagentEntries(entries)
+}
+
+export function reduceSubagentStream(
+  current: SubagentStream | undefined,
+  sessionId: string,
+  evt: RunEvent,
+): SubagentStream {
+  const eventName = String(evt.event || '')
+  const subagentId = String((evt as any).subagent_id || evt.delegation_id || `${(evt as any).task_index ?? 0}`)
+  const timestamp = subagentEventTimestamp(evt.timestamp || (evt as any).updated_at)
+  const backgroundSequence = Number((evt as any).background_seq)
+  if (
+    current
+    && Number.isFinite(backgroundSequence)
+    && current.lastBackgroundSeq != null
+    && backgroundSequence <= current.lastBackgroundSeq
+  ) {
+    return current
+  }
+
+  const incomingTaskIndex = Number((evt as any).task_index)
+  const incomingTaskCount = Number((evt as any).task_count)
+  const goal = String((evt as any).goal || '').trim()
+  const model = String((evt as any).model || '').trim()
+  const summary = String((evt as any).summary || '').trim()
+  const rawText = String(evt.text || evt.preview || '')
+  const text = rawText.trim()
+  const toolName = String((evt as any).tool || (evt as any).name || '').trim()
+  const durationSeconds = Number((evt as any).duration_seconds ?? (evt as any).duration)
+  const toolCount = Number((evt as any).tool_count)
+  const apiCalls = Number((evt as any).api_calls)
+  const inputTokens = Number((evt as any).input_tokens)
+  const outputTokens = Number((evt as any).output_tokens)
+  const costUsd = Number((evt as any).cost_usd)
+  const isTerminal = eventName === 'subagent.complete'
+    || (eventName === 'delegation.updated' && ['completed', 'failed', 'error', 'cancelled', 'interrupted'].includes(String((evt as any).status || '').toLowerCase()))
+  if (current && current.status !== 'running' && !isTerminal) return current
+  const nextStatus = isTerminal
+    ? subagentStatus((evt as any).status, 'completed')
+    : 'running'
+  const entries = current ? [...current.entries] : []
+  const entryId = subagentEntryId(eventName, evt)
+
+  if (eventName === 'subagent.start') {
+    if (!entries.some(entry => entry.kind === 'status' && entry.status === 'started')) {
+      entries.push({ id: entryId, kind: 'status', status: 'started', timestamp, text: goal || undefined })
+    }
+  } else if (eventName === 'subagent.text' && rawText) {
+    appendSubagentText(entries, { id: entryId, kind: 'text', timestamp, text: rawText })
+  } else if (eventName === 'subagent.thinking' && rawText) {
+    appendSubagentText(entries, { id: entryId, kind: 'thinking', timestamp, text: rawText })
+  } else if (eventName === 'subagent.tool') {
+    entries.push({
+      id: entryId,
+      kind: 'tool',
+      timestamp,
+      text: text || undefined,
+      toolName: toolName || undefined,
+      toolArgs: (evt as any).arguments,
+    })
+  } else if (eventName === 'subagent.progress' && text) {
+    const previous = entries[entries.length - 1]
+    const progressEntry: SubagentStreamEntry = {
+      id: entryId,
+      kind: 'status',
+      status: 'running',
+      timestamp,
+      text,
+    }
+    if (previous?.kind === 'status' && previous.status === 'running') entries[entries.length - 1] = progressEntry
+    else entries.push(progressEntry)
+  }
+
+  if (isTerminal) {
+    const finalText = summary || text
+    const previousText = [...entries].reverse().find(entry => entry.kind === 'text')?.text?.trim()
+    if (finalText && previousText !== finalText) {
+      entries.push({ id: `${entryId}:summary`, kind: 'text', timestamp, text: finalText })
+    }
+    const previous = entries[entries.length - 1]
+    const terminalEntry: SubagentStreamEntry = {
+      id: entryId,
+      kind: 'status',
+      status: nextStatus,
+      timestamp,
+    }
+    if (previous?.kind === 'status' && previous.status !== 'started') entries[entries.length - 1] = terminalEntry
+    else entries.push(terminalEntry)
+  }
+
+  return {
+    sessionId,
+    subagentId,
+    taskIndex: Number.isFinite(incomingTaskIndex) ? incomingTaskIndex : current?.taskIndex || 0,
+    taskCount: Number.isFinite(incomingTaskCount) && incomingTaskCount > 0 ? incomingTaskCount : current?.taskCount || 1,
+    goal: goal || current?.goal,
+    model: model || current?.model,
+    status: nextStatus,
+    startedAt: current?.startedAt || subagentEventTimestamp((evt as any).started_at || timestamp),
+    updatedAt: timestamp,
+    completedAt: isTerminal ? subagentEventTimestamp((evt as any).completed_at || timestamp) : current?.completedAt,
+    durationSeconds: Number.isFinite(durationSeconds) ? durationSeconds : current?.durationSeconds,
+    toolCount: Number.isFinite(toolCount) ? toolCount : current?.toolCount,
+    apiCalls: Number.isFinite(apiCalls) ? apiCalls : current?.apiCalls,
+    inputTokens: Number.isFinite(inputTokens) ? inputTokens : current?.inputTokens,
+    outputTokens: Number.isFinite(outputTokens) ? outputTokens : current?.outputTokens,
+    costUsd: Number.isFinite(costUsd) ? costUsd : current?.costUsd,
+    summary: summary || current?.summary,
+    lastBackgroundSeq: Number.isFinite(backgroundSequence) ? backgroundSequence : current?.lastBackgroundSeq,
+    entries: trimSubagentEntries(entries),
+  }
+}
+
+export interface MessageReference {
+  id: string
+  role: 'user' | 'assistant'
+  content: string
+  sender?: string
+}
+
+export interface ParsedMessageReference {
+  content: string
+  reply: string
+}
+
+export function parseMessageReference(content: string): ParsedMessageReference | null {
+  if (!content.startsWith('<quoted_message')) return null
+  const openEnd = content.indexOf('>\n')
+  if (openEnd === -1) return null
+  const closeMarker = '\n</quoted_message>'
+  const closeStart = content.indexOf(closeMarker, openEnd + 2)
+  if (closeStart === -1) return null
+
+  return {
+    content: content.slice(openEnd + 2, closeStart).trim(),
+    reply: content.slice(closeStart + closeMarker.length).trim(),
+  }
+}
+
+export function formatReferencedContentForDisplay(content: string): string {
+  return content
+    .trim()
+    .split(/\r?\n/)
+    .map(line => line ? `> ${line}` : '>')
+    .join('\n')
+}
+
+export function formatMessageWithReference(reference: MessageReference, content: string): string {
+  const sender = reference.sender?.trim()
+  const openTag = sender
+    ? `<quoted_message sender=${JSON.stringify(sender)}>`
+    : '<quoted_message>'
+  const quotedContent = reference.content.trim()
+  const reply = content.trim()
+  const referenceBlock = `${openTag}\n${quotedContent}\n</quoted_message>`
+  return reply ? `${referenceBlock}\n\n${reply}` : referenceBlock
 }
 
 export interface PendingApproval {
@@ -98,7 +366,7 @@ export interface Session {
   agent?: string
   agentSessionId?: string
   agentNativeSessionId?: string
-  codingAgentId?: 'claude-code' | 'codex'
+  codingAgentId?: ChatCodingAgentId
   codingAgentMode?: 'global' | 'scoped'
   messages: Message[]
   createdAt: number
@@ -125,9 +393,11 @@ export interface Session {
   lastActiveAt?: number
   isArchived?: boolean
   workspace?: string | null
+  categoryId?: number | null
+  isLocalOnly?: boolean
   /** Per-session reasoning effort override.
    * Empty string / undefined = use config.yaml default.
-   * Values: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' */
+   * Values: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' */
   reasoningEffort?: string
 }
 
@@ -142,6 +412,48 @@ interface CompressionState {
 
 function uid(): string {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+}
+
+export function alignWorkspaceChangeAssistantMessage(
+  messages: Message[],
+  change: WorkspaceRunChangeSummary | null | undefined,
+  assistantMessageId?: string | null,
+): string | null {
+  const currentAssistantMessageId = String(assistantMessageId || '').trim()
+  const persistedAssistantMessageId = String(change?.assistant_message_id || '').trim()
+  if (!persistedAssistantMessageId) return currentAssistantMessageId || null
+  if (!currentAssistantMessageId || persistedAssistantMessageId === currentAssistantMessageId) {
+    return messages.some(item => item.id === persistedAssistantMessageId)
+      ? persistedAssistantMessageId
+      : currentAssistantMessageId || null
+  }
+  const message = messages.find(item => item.id === currentAssistantMessageId)
+  const idAlreadyLoaded = messages.some(item => item.id === persistedAssistantMessageId)
+  if (message && !idAlreadyLoaded) {
+    message.id = persistedAssistantMessageId
+    return persistedAssistantMessageId
+  }
+  return idAlreadyLoaded ? persistedAssistantMessageId : currentAssistantMessageId
+}
+
+export function attachWorkspaceChangesToExactTurns(
+  messages: Message[],
+  changes: WorkspaceRunChangeSummary[],
+): WorkspaceRunChangeSummary[] {
+  for (const message of messages) message.workspaceChanges = []
+  const assistantById = new Map(
+    messages
+      .filter(message => message.role === 'assistant')
+      .map(message => [message.id, message]),
+  )
+  const fallback: WorkspaceRunChangeSummary[] = []
+  for (const change of changes) {
+    const assistantMessageId = String(change.assistant_message_id || '').trim()
+    const target = assistantMessageId ? assistantById.get(assistantMessageId) : undefined
+    if (target) target.workspaceChanges!.push(change)
+    else fallback.push(change)
+  }
+  return fallback
 }
 
 function isToolOutputError(output: unknown): boolean {
@@ -251,6 +563,14 @@ function runtimeToolPayloadOrUndefined(value: unknown): unknown | undefined {
   return hasRuntimeToolPayload(value) ? value : undefined
 }
 
+function runtimeToolOutputFromEvent(event: unknown): unknown | undefined {
+  if (!event || typeof event !== 'object') return undefined
+  const record = event as Record<string, unknown>
+  return runtimeToolPayloadOrUndefined(
+    record.output ?? record.result ?? record.content ?? record.preview,
+  )
+}
+
 function runtimePayloadText(value: unknown): string {
   if (!hasRuntimeToolPayload(value)) return ''
   if (typeof value === 'string') return value
@@ -261,6 +581,25 @@ function runtimePayloadText(value: unknown): string {
     // Fall through to String(value) for non-serializable runtime payloads.
   }
   return String(value)
+}
+
+function runtimeObjectPayload(value: unknown): Record<string, unknown> | null {
+  if (!value) return null
+  if (typeof value === 'object' && !Array.isArray(value)) return value as Record<string, unknown>
+  if (typeof value !== 'string') return null
+  try {
+    const parsed = JSON.parse(value)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null
+  } catch {
+    return null
+  }
+}
+
+function isBackgroundDelegateToolPayload(toolName: unknown, payload: unknown): boolean {
+  if (String(toolName || '') !== 'delegate_task') return false
+  return runtimeObjectPayload(payload)?.mode === 'background'
 }
 
 function parsePersistedMoaToolPayload(toolName: string | undefined, value: unknown): { preview?: string; result?: unknown } | null {
@@ -431,6 +770,7 @@ function mapHermesMessages(msgs: HermesMessage[]): Message[] {
       const toolName = msg.tool_name || toolNameMap.get(tcId) || undefined
       const toolArgs = toolArgsMap.has(tcId) ? toolArgsMap.get(tcId) : undefined
       const moaPayload = parsePersistedMoaToolPayload(toolName, (msg as any).content)
+      const backgroundDelegate = isBackgroundDelegateToolPayload(toolName, (msg as any).content)
       // Extract a short preview from the content
       let preview = moaPayload?.preview || ''
       const contentText = runtimePayloadText((msg as any).content)
@@ -451,6 +791,7 @@ function mapHermesMessages(msgs: HermesMessage[]): Message[] {
       if (placeholderIdx !== -1) {
         result.splice(placeholderIdx, 1)
       }
+      if (backgroundDelegate) continue
       result.push({
         id: String(msg.id),
         role: 'tool',
@@ -461,7 +802,7 @@ function mapHermesMessages(msgs: HermesMessage[]): Message[] {
         toolArgs,
         toolPreview: typeof preview === 'string' ? preview.slice(0, 100) || undefined : undefined,
         toolResult: moaPayload ? runtimeToolPayloadOrUndefined(moaPayload.result) : runtimeToolPayloadOrUndefined((msg as any).content),
-        toolStatus: 'done',
+        toolStatus: readFinishReason(msg) === 'error' ? 'error' : 'done',
         finishReason: readFinishReason(msg),
         runMarker: readRunMarker(msg),
       })
@@ -516,8 +857,8 @@ function lastVisibleMessageRole(messages?: Message[] | null): string | null {
 }
 
 function mapHermesSession(s: SessionSummary): Session {
-  const isCodingAgentSession = s.source === 'coding_agent' || s.agent === 'claude' || s.agent === 'codex'
-  const codingAgentId = s.agent === 'codex' ? 'codex' : s.agent === 'claude' ? 'claude-code' : undefined
+  const codingAgentId = agentToCodingAgentId(s.agent)
+  const isCodingAgentSession = s.source === 'coding_agent' || Boolean(codingAgentId)
   const codingAgentMode = isCodingAgentSession
     ? (s.agent_mode === 'global' || s.agent_mode === 'scoped'
         ? s.agent_mode
@@ -539,6 +880,7 @@ function mapHermesSession(s: SessionSummary): Session {
     updatedAt: Math.round(activitySeconds * 1000),
     model: s.model,
     provider: s.provider || (s as any).billing_provider || '',
+    apiMode: s.api_mode,
     messageCount: s.message_count,
     messageTotal: s.message_count,
     loadedMessageCount: 0,
@@ -554,6 +896,7 @@ function mapHermesSession(s: SessionSummary): Session {
     lastActiveAt: s.last_active != null ? Math.round(s.last_active * 1000) : undefined,
     isArchived: Boolean(s.is_archived),
     workspace: s.workspace || null,
+    categoryId: s.category_id ?? null,
   }
 }
 
@@ -561,6 +904,7 @@ const STORAGE_KEY_PREFIX = 'hermes_active_session_'
 type ChatRuntimeMode = 'default' | 'global_agent'
 let activeRuntimeMode: ChatRuntimeMode = 'default'
 const LEGACY_STORAGE_KEY = 'hermes_active_session'
+const SESSION_PROFILE_FILTER_STORAGE_KEY = 'hermes_session_profile_filter_v1'
 
 // 获取当前 profile 名称，用于隔离缓存。
 // 从 profiles store 的 activeProfileName（同步 localStorage）读取，
@@ -582,16 +926,18 @@ function legacyStorageKey(): string | null { return activeRuntimeMode === 'defau
 
 function isCodingAgentLikeSession(session?: Pick<Session, 'source' | 'agent' | 'codingAgentId'> | null): boolean {
   return session?.source === 'coding_agent' ||
-    session?.codingAgentId === 'claude-code' ||
-    session?.codingAgentId === 'codex' ||
-    session?.agent === 'claude' ||
-    session?.agent === 'codex'
+    Boolean(session?.codingAgentId) ||
+    Boolean(agentToCodingAgentId(session?.agent))
 }
 
 function clearCodingAgentRuntimeCredentials(session?: Session | null) {
   if (!session || !isCodingAgentLikeSession(session)) return
   session.baseUrl = undefined
   session.apiKey = undefined
+}
+
+function shouldPreserveRuntimeApiMode(session?: Session | null): boolean {
+  return isCodingAgentLikeSession(session) && session?.codingAgentMode !== 'global'
 }
 
 function isQuotaExceededError(error: unknown): boolean {
@@ -676,13 +1022,26 @@ export const useChatStore = defineStore('chat', () => {
   const pendingForkCommands = ref<Set<string>>(new Set())
   /** Sessions that completed while the user was viewing another session. */
   const completedUnreadSessions = ref<Set<string>>(new Set())
-  const sessionProfileFilter = ref<string | null>(null)
+  /** UI-only live streams for Hermes background subagents. Never sent into parent context. */
+  const subagentStreams = ref<Map<string, SubagentStream>>(new Map())
+  const storedSessionProfileFilter = getItemBestEffort(SESSION_PROFILE_FILTER_STORAGE_KEY)?.trim()
+  const sessionProfileFilter = ref<string | null>(
+    storedSessionProfileFilter && storedSessionProfileFilter !== '__all__'
+      ? storedSessionProfileFilter
+      : null,
+  )
   /** sessionId → queued message count */
   const queueLengths = ref<Map<string, number>>(new Map())
   /** sessionId → queued user messages not yet visible in the transcript */
   const queuedUserMessages = ref<Map<string, Message[]>>(new Map())
   /** sessionId → queue ids that server reported as dequeued before the peer message arrived */
   const dequeuedQueueIds = ref<Map<string, Set<string>>>(new Map())
+  /** sessionId → message selected as the reference for the next user turn */
+  const messageReferences = ref<Map<string, MessageReference>>(new Map())
+  const activeMessageReference = computed(() => {
+    const sid = activeSessionId.value
+    return sid ? messageReferences.value.get(sid) || null : null
+  })
   const pendingApprovals = ref<Map<string, PendingApproval>>(new Map())
   const activePendingApproval = computed(() => {
     const sid = activeSessionId.value
@@ -694,6 +1053,22 @@ export const useChatStore = defineStore('chat', () => {
     const sid = activeSessionId.value
     return sid ? pendingClarifies.value.get(sid) || null : null
   })
+
+  function setSessionProfileFilter(profile: string | null) {
+    const normalized = profile?.trim()
+    sessionProfileFilter.value = normalized && normalized !== '__all__' ? normalized : null
+    if (sessionProfileFilter.value) {
+      setItemBestEffort(SESSION_PROFILE_FILTER_STORAGE_KEY, sessionProfileFilter.value)
+    } else {
+      removeItem(SESSION_PROFILE_FILTER_STORAGE_KEY)
+    }
+  }
+
+  function validateSessionProfileFilter(profileNames: string[]) {
+    const current = sessionProfileFilter.value
+    if (!current || profileNames.length === 0 || profileNames.includes(current)) return
+    setSessionProfileFilter(null)
+  }
 
   // 自动播放语音开关
   const autoPlaySpeechEnabled = ref(false)
@@ -801,6 +1176,19 @@ export const useChatStore = defineStore('chat', () => {
     completedUnreadSessions.value = next
   }
 
+  function setMessageReference(sessionId: string, reference: MessageReference) {
+    const next = new Map(messageReferences.value)
+    next.set(sessionId, reference)
+    messageReferences.value = next
+  }
+
+  function clearMessageReference(sessionId: string) {
+    if (!messageReferences.value.has(sessionId)) return
+    const next = new Map(messageReferences.value)
+    next.delete(sessionId)
+    messageReferences.value = next
+  }
+
   function markSessionCompletedUnread(sessionId: string, hasQueue = false) {
     if (hasQueue) {
       return
@@ -833,21 +1221,24 @@ export const useChatStore = defineStore('chat', () => {
     const target = sessions.value.find(session => session.id === sessionId)
     if (!target) return
     const changes = workspaceRunChangesBySession.value.get(sessionId)
-    const runChanges: WorkspaceRunChangeSummary[] = []
+    const existingById = new Map(
+      target.messages
+        .filter(message => message.id.startsWith(WORKSPACE_RUN_CHANGE_MESSAGE_PREFIX))
+        .map(message => [message.id, message]),
+    )
+    target.messages = target.messages.filter(message => !message.id.startsWith(WORKSPACE_RUN_CHANGE_MESSAGE_PREFIX))
     for (const message of target.messages) {
       if (message.role === 'tool' && message.toolCallId) {
         message.toolChange = changes?.get(message.toolCallId)
       }
-      if (message.id.startsWith(WORKSPACE_RUN_CHANGE_MESSAGE_PREFIX)) {
-        const changeId = message.id.slice(WORKSPACE_RUN_CHANGE_MESSAGE_PREFIX.length)
-        message.toolChange = changes?.get(changeId)
-      }
     }
-    if (!changes) return
-    for (const change of changes.values()) {
-      if (change?.source === 'run') runChanges.push(change)
+    if (!changes) {
+      for (const message of target.messages) message.workspaceChanges = []
+      return
     }
-    insertWorkspaceRunChangeMessages(target, runChanges)
+    const runChanges = [...changes.values()].filter(change => change?.source === 'run')
+    const legacyChanges = attachWorkspaceChangesToExactTurns(target.messages, runChanges)
+    insertWorkspaceRunChangeMessages(target, legacyChanges, existingById)
   }
 
   function workspaceRunChangeMessageId(changeId: string): string {
@@ -859,7 +1250,11 @@ export const useChatStore = defineStore('chat', () => {
     return Number.isFinite(seconds) && seconds > 0 ? Math.round(seconds * 1000) : Date.now()
   }
 
-  function insertWorkspaceRunChangeMessages(target: Session, changes: WorkspaceRunChangeSummary[]) {
+  function insertWorkspaceRunChangeMessages(
+    target: Session,
+    changes: WorkspaceRunChangeSummary[],
+    existingById = new Map<string, Message>(),
+  ) {
     const sortedChanges = changes
       .filter(change => change?.change_id && (change.files?.length > 0))
       .sort((a, b) => {
@@ -867,12 +1262,6 @@ export const useChatStore = defineStore('chat', () => {
         return timeDelta !== 0 ? timeDelta : b.change_id.localeCompare(a.change_id)
       })
     if (!sortedChanges.length) return
-    const existingById = new Map(
-      target.messages
-        .filter(message => message.id.startsWith(WORKSPACE_RUN_CHANGE_MESSAGE_PREFIX))
-        .map(message => [message.id, message]),
-    )
-    target.messages = target.messages.filter(message => !message.id.startsWith(WORKSPACE_RUN_CHANGE_MESSAGE_PREFIX))
     for (const change of sortedChanges) {
       const messageId = workspaceRunChangeMessageId(change.change_id)
       const existing = existingById.get(messageId) || null
@@ -925,12 +1314,29 @@ export const useChatStore = defineStore('chat', () => {
     attachToolChangesToMessages(sessionId)
   }
 
-  function handleWorkspaceRunChangeEvent(sessionId: string, evt: any) {
-    upsertWorkspaceRunChange(sessionId, evt?.change as WorkspaceRunChangeSummary | undefined)
+  function handleWorkspaceRunChangeEvent(
+    sessionId: string,
+    evt: any,
+    assistantMessageId?: string | null,
+  ): string | null {
+    const change = evt?.change as WorkspaceRunChangeSummary | undefined
+    const target = sessions.value.find(session => session.id === sessionId)
+    const alignedAssistantMessageId = target
+      ? alignWorkspaceChangeAssistantMessage(target.messages, change, assistantMessageId)
+      : assistantMessageId || null
+    upsertWorkspaceRunChange(sessionId, change)
+    return alignedAssistantMessageId
   }
 
-  function handleTerminalWorkspaceRunChange(sessionId: string, evt: any) {
-    upsertWorkspaceRunChange(sessionId, evt?.workspace_run_change as WorkspaceRunChangeSummary | undefined)
+  function handleTerminalWorkspaceRunChange(
+    sessionId: string,
+    evt: any,
+    assistantMessageId?: string | null,
+  ) {
+    const change = evt?.workspace_run_change as WorkspaceRunChangeSummary | undefined
+    const target = sessions.value.find(session => session.id === sessionId)
+    if (target) alignWorkspaceChangeAssistantMessage(target.messages, change, assistantMessageId)
+    upsertWorkspaceRunChange(sessionId, change)
   }
 
   function restoreWorkspaceRunChangeMessages(sessionId: string) {
@@ -961,6 +1367,7 @@ export const useChatStore = defineStore('chat', () => {
         ...mapped,
         messages: existing.messages,
         contextTokens: existing.contextTokens,
+        apiMode: mapped.apiMode || existing.apiMode,
         loadedMessageCount: existing.loadedMessageCount,
         hasMoreBefore: existing.hasMoreBefore,
       })
@@ -980,11 +1387,13 @@ export const useChatStore = defineStore('chat', () => {
       const runtimeByIdBefore = new Map(sessions.value.map(s => [s.id, {
         messages: s.messages,
         contextTokens: s.contextTokens,
+        apiMode: s.apiMode,
       }]))
       for (const s of fresh) {
         const prev = runtimeByIdBefore.get(s.id)
         if (prev?.messages?.length) s.messages = prev.messages
         if (prev?.contextTokens != null) s.contextTokens = prev.contextTokens
+        if (!s.apiMode && prev?.apiMode) s.apiMode = prev.apiMode
       }
       sessions.value = fresh
       pruneCompletedUnreadSessions(new Set(sessions.value.map(s => s.id)))
@@ -1052,10 +1461,13 @@ export const useChatStore = defineStore('chat', () => {
           existing.endedAt = fresh.endedAt
           existing.model = fresh.model
           existing.provider = fresh.provider
+          existing.apiMode = fresh.apiMode || existing.apiMode
           existing.messageCount = fresh.messageCount
           existing.inputTokens = fresh.inputTokens
           existing.outputTokens = fresh.outputTokens
           existing.workspace = fresh.workspace
+          existing.categoryId = fresh.categoryId
+          existing.isLocalOnly = false
           // messageTotal: keep the larger of server count vs what we've loaded,
           // so we don't shrink below already-rendered messages mid-session.
           if (fresh.messageTotal != null) {
@@ -1109,6 +1521,9 @@ export const useChatStore = defineStore('chat', () => {
       target.messageCount = detail.total
       target.hasMoreBefore = detail.hasMore
       if (detail.session.title) target.title = detail.session.title
+      target.workspace = detail.session.workspace || target.workspace || null
+      target.categoryId = detail.session.category_id ?? null
+      target.isLocalOnly = false
       target.parentSessionId = detail.session.parent_session_id || target.parentSessionId || null
       target.forkPointMessageId = (detail.session as any).fork_point_message_id != null ? String((detail.session as any).fork_point_message_id) : target.forkPointMessageId || null
       target.parentTitle = detail.session.parent_title || target.parentTitle || null
@@ -1128,23 +1543,24 @@ export const useChatStore = defineStore('chat', () => {
     model?: string
     provider?: string
     source?: 'api_server' | 'cli' | 'coding_agent' | 'global_agent' | 'workflow'
-    agent?: 'hermes' | 'claude' | 'codex'
-    codingAgentId?: 'claude-code' | 'codex'
+    agent?: ChatAgentId
+    codingAgentId?: ChatCodingAgentId
     codingAgentMode?: 'global' | 'scoped'
     workspace?: string | null
+    categoryId?: number | null
     baseUrl?: string
     apiKey?: string
     apiMode?: ProviderApiMode
   } = {}): Session {
     const source = runtimeMode.value === 'global_agent' ? 'global_agent' : options.source || 'cli'
-    const codingAgentId = options.codingAgentId || (options.agent === 'codex' ? 'codex' : options.agent === 'claude' ? 'claude-code' : undefined)
+    const codingAgentId = options.codingAgentId || agentToCodingAgentId(options.agent)
     const codingAgentMode = codingAgentId ? (options.codingAgentMode || 'scoped') : undefined
     const session: Session = {
       id: uid(),
       profile: options.profile || useProfilesStore().activeProfileName || 'default',
       title: '',
       source,
-      agent: options.agent || (codingAgentId ? (codingAgentId === 'codex' ? 'codex' : 'claude') : 'hermes'),
+      agent: options.agent || codingAgentIdToAgent(codingAgentId) || 'hermes',
       codingAgentId,
       codingAgentMode,
       messages: [],
@@ -1153,6 +1569,8 @@ export const useChatStore = defineStore('chat', () => {
       model: options.model || undefined,
       provider: options.provider || '',
       workspace: options.workspace || null,
+      categoryId: options.categoryId ?? null,
+      isLocalOnly: true,
       baseUrl: options.baseUrl,
       apiKey: options.apiKey,
       apiMode: options.apiMode,
@@ -1199,6 +1617,7 @@ export const useChatStore = defineStore('chat', () => {
     if (!activeSession.value) return
 
     isLoadingMessages.value = true
+    let backgroundPendingOnResume = 0
 
     try {
       // Load messages via Socket.IO resume (server loads from DB if not in memory)
@@ -1220,6 +1639,7 @@ export const useChatStore = defineStore('chat', () => {
           } else {
             serverWorking.value.delete(sessionId)
           }
+          backgroundPendingOnResume = Number(data.backgroundPending || 0)
           if (data.queueLength && data.queueLength > 0) {
             queueLengths.value.set(sessionId, data.queueLength)
           } else {
@@ -1239,6 +1659,10 @@ export const useChatStore = defineStore('chat', () => {
           if (data.inputTokens != null) target.inputTokens = data.inputTokens
           if (data.outputTokens != null) target.outputTokens = data.outputTokens
           if ((data as any).contextTokens != null) target.contextTokens = (data as any).contextTokens
+          if (typeof data.workspace === 'string') {
+            target.workspace = data.workspace.trim() || null
+            target.isLocalOnly = false
+          }
           target.parentSessionId = (data as any).parentSessionId || target.parentSessionId || null
           target.forkPointMessageId = (data as any).forkPointMessageId != null ? String((data as any).forkPointMessageId) : target.forkPointMessageId || null
           target.parentTitle = (data as any).parentTitle || target.parentTitle || null
@@ -1289,6 +1713,7 @@ export const useChatStore = defineStore('chat', () => {
                 setAbortState({ aborting: true, synced: false, timedOut: true, message: (e as any).message })
               } else if (e.event === 'abort.completed') {
                 setAbortState({ aborting: false, synced: e.synced ?? false })
+                settleInterruptedSubagents(sessionId)
               } else if (e.event === 'approval.requested') {
                 setPendingApproval({ ...e, session_id: sessionId } as RunEvent)
               } else if (e.event === 'approval.resolved') {
@@ -1307,6 +1732,7 @@ export const useChatStore = defineStore('chat', () => {
               } else if (e.event === 'workspace.diff.completed') {
                 handleWorkspaceRunChangeEvent(sessionId, e)
               } else if (e.event === 'tool.started') {
+                if (isBackgroundDelegateToolPayload(e.tool || e.name, (e as any).arguments)) continue
                 const msgs = getSessionMsgs(sessionId)
                 const toolCallId = e.tool_call_id as string | undefined
                 const existingTool = toolCallId
@@ -1332,25 +1758,50 @@ export const useChatStore = defineStore('chat', () => {
                     toolStatus: 'running',
                   })
                 }
-              } else if (e.event === 'tool.completed') {
+              } else if (e.event === 'tool.completed' || e.event === 'tool.failed') {
                 const msgs = getSessionMsgs(sessionId)
                 const toolCallId = e.tool_call_id as string | undefined
                 const toolMsgs = toolCallId
                   ? msgs.filter(m => m.role === 'tool' && m.toolCallId === toolCallId)
                   : msgs.filter(m => m.role === 'tool' && m.toolStatus === 'running')
+                const output = runtimeToolOutputFromEvent(e)
+                const toolName = e.tool || e.name || toolMsgs[toolMsgs.length - 1]?.toolName
+                if (isBackgroundDelegateToolPayload(toolName, output)) {
+                  target.messages = target.messages.filter(message => !toolMsgs.includes(message))
+                  continue
+                }
                 if (toolMsgs.length > 0) {
-                  const output = runtimeToolPayloadOrUndefined((e as any).output)
                   updateMessage(sessionId, toolMsgs[toolMsgs.length - 1].id, {
-                    toolStatus: e.error === true || runtimeToolOutputHasError(output) ? 'error' : 'done',
+                    toolStatus: e.event === 'tool.failed' || e.error === true || runtimeToolOutputHasError(output) ? 'error' : 'done',
                     toolDuration: e.duration,
                     toolResult: output,
                   })
                 }
               } else if (e.event === 'moa.reference' || e.event === 'moa.aggregating') {
                 handleMoaEvent(sessionId, e as RunEvent)
-              } else if (String(e.event || '').startsWith('subagent.')) {
+              } else if (String(e.event || '').startsWith('subagent.') || e.event === 'delegation.updated') {
                 handleSubagentEvent(sessionId, e as RunEvent)
               }
+            }
+          }
+          if (Array.isArray(data.backgroundTasks)) {
+            for (const task of data.backgroundTasks) {
+              const lastEvent = String(task.last_event || '')
+              const status = String(task.status || '')
+              const event = lastEvent.startsWith('subagent.')
+                ? lastEvent
+                : status === 'running' ? 'subagent.progress' : 'subagent.complete'
+              handleSubagentEvent(sessionId, {
+                ...task,
+                event,
+                session_id: sessionId,
+                background_snapshot: true,
+                subagent_id: task.subagent_id,
+                tool: task.last_tool,
+                name: task.last_tool,
+                text: task.preview,
+                duration_seconds: task.duration_seconds,
+              } as RunEvent)
             }
           }
           resolve()
@@ -1367,7 +1818,7 @@ export const useChatStore = defineStore('chat', () => {
 
     // Resume in-flight run event listeners if needed
     if (activeSessionId.value === sessionId) {
-      resumeServerWorkingRun(sessionId)
+      resumeServerWorkingRun(sessionId, backgroundPendingOnResume > 0, !serverWorking.value.has(sessionId))
     }
   }
 
@@ -1408,17 +1859,18 @@ export const useChatStore = defineStore('chat', () => {
     model?: string
     provider?: string
     source?: 'api_server' | 'cli' | 'coding_agent' | 'global_agent' | 'workflow'
-    agent?: 'hermes' | 'claude' | 'codex'
-    codingAgentId?: 'claude-code' | 'codex'
+    agent?: ChatAgentId
+    codingAgentId?: ChatCodingAgentId
     codingAgentMode?: 'global' | 'scoped'
     workspace?: string | null
+    categoryId?: number | null
     baseUrl?: string
     apiKey?: string
     apiMode?: ProviderApiMode
   } = {}): Session {
     const appStore = useAppStore()
     const storageSource = runtimeMode.value === 'global_agent' ? 'global_agent' : options.source || 'cli'
-    const codingAgentId = options.codingAgentId || (options.agent === 'codex' ? 'codex' : options.agent === 'claude' ? 'claude-code' : undefined)
+    const codingAgentId = options.codingAgentId || agentToCodingAgentId(options.agent)
     const isGlobalCodingAgent = Boolean(codingAgentId) && options.codingAgentMode === 'global'
     const session = createSession({
       profile: options.profile,
@@ -1429,6 +1881,7 @@ export const useChatStore = defineStore('chat', () => {
       codingAgentId,
       codingAgentMode: options.codingAgentMode,
       workspace: options.workspace,
+      categoryId: options.categoryId,
       baseUrl: options.baseUrl,
       apiKey: options.apiKey,
       apiMode: options.apiMode,
@@ -1447,18 +1900,25 @@ export const useChatStore = defineStore('chat', () => {
     const shouldClearRuntimeCredentials = previousProvider !== nextProvider && (
       isCodingAgentLikeSession(target) || isCodingAgentLikeSession(activeTarget)
     )
-    const ok = await setSessionModel(targetId, modelId, provider || '', apiMode)
-    if (!ok) return false
+    const preservedApiMode = apiMode || (previousProvider === nextProvider
+      ? (shouldPreserveRuntimeApiMode(target) ? target?.apiMode : undefined) ||
+        (shouldPreserveRuntimeApiMode(activeTarget) ? activeTarget?.apiMode : undefined)
+      : undefined)
+    const isLocalOnly = target?.isLocalOnly === true || activeTarget?.isLocalOnly === true
+    if (!isLocalOnly) {
+      const ok = await setSessionModel(targetId, modelId, provider || '', preservedApiMode)
+      if (!ok) return false
+    }
     if (target) {
       target.model = modelId
       target.provider = provider || ''
-      if (apiMode) target.apiMode = apiMode
+      target.apiMode = preservedApiMode
       if (shouldClearRuntimeCredentials) clearCodingAgentRuntimeCredentials(target)
     }
     if (activeTarget) {
       activeTarget.model = modelId
       activeTarget.provider = provider || ''
-      if (apiMode) activeTarget.apiMode = apiMode
+      activeTarget.apiMode = preservedApiMode
       if (shouldClearRuntimeCredentials) clearCodingAgentRuntimeCredentials(activeTarget)
     }
     return true
@@ -1469,6 +1929,7 @@ export const useChatStore = defineStore('chat', () => {
     const ok = await deleteSessionApi(sessionId, target?.profile)
     if (!ok) return false
     sessions.value = sessions.value.filter(s => s.id !== sessionId)
+    clearMessageReference(sessionId)
     if (activeSessionId.value === sessionId) {
       if (sessions.value.length > 0) {
         await switchSession(sessions.value[0].id)
@@ -1485,6 +1946,7 @@ export const useChatStore = defineStore('chat', () => {
     const ok = await archiveSessionApi(sessionId)
     if (!ok) return false
     sessions.value = sessions.value.filter(s => s.id !== sessionId)
+    clearMessageReference(sessionId)
     if (completedUnreadSessions.value.has(sessionId)) {
       const next = new Set(completedUnreadSessions.value)
       next.delete(sessionId)
@@ -1535,7 +1997,7 @@ export const useChatStore = defineStore('chat', () => {
   function settleRunningTools(sessionId: string, status: 'done' | 'error') {
     const msgs = getSessionMsgs(sessionId)
     msgs.forEach((m, i) => {
-      if (m.role === 'tool' && m.toolStatus === 'running') {
+      if (m.role === 'tool' && m.toolStatus === 'running' && !m.toolCallId?.startsWith('subagent:')) {
         msgs[i] = { ...m, toolStatus: status }
       }
     })
@@ -1559,42 +2021,77 @@ export const useChatStore = defineStore('chat', () => {
 
   function handleSubagentEvent(sessionId: string, evt: RunEvent) {
     const eventName = String(evt.event || '')
-    if (!eventName.startsWith('subagent.')) return
+    if (!eventName.startsWith('subagent.') && eventName !== 'delegation.updated') return
+
+    if (eventName === 'delegation.updated') {
+      const delegationId = String(evt.delegation_id || '').trim()
+      const status = subagentStatus((evt as any).status)
+      if (status === 'running') return
+      const sessionStreams = [...subagentStreams.value.values()].filter(stream =>
+        stream.sessionId === sessionId && stream.status === 'running',
+      )
+      const exactMatch = sessionStreams.find(stream => stream.subagentId === delegationId)
+      const targets = exactMatch
+        ? [exactMatch]
+        : ['failed', 'error', 'cancelled', 'interrupted'].includes(status)
+          ? sessionStreams
+          : []
+      for (const stream of targets) {
+        handleSubagentEvent(sessionId, {
+          ...evt,
+          event: 'subagent.complete',
+          subagent_id: stream.subagentId,
+          task_index: stream.taskIndex,
+          task_count: stream.taskCount,
+          goal: stream.goal,
+          model: stream.model,
+          status,
+        })
+      }
+      return
+    }
 
     const subagentId = String((evt as any).subagent_id || `${(evt as any).task_index ?? 0}`)
-    const toolCallId = `subagent:${evt.run_id || 'run'}:${subagentId}`
+    const streamKey = `${sessionId}:${subagentId}`
+    const currentStream = subagentStreams.value.get(streamKey)
+    const nextStream = reduceSubagentStream(currentStream, sessionId, evt)
+    if (nextStream === currentStream) return
+    subagentStreams.value.set(streamKey, nextStream)
+    const toolCallId = `subagent:${subagentId}`
     const taskIndex = Number((evt as any).task_index ?? 0)
     const taskCount = Number((evt as any).task_count ?? 1)
     const label = `${taskIndex + 1}/${Math.max(1, taskCount || 1)}`
     const toolName = String((evt as any).tool || (evt as any).name || '')
     const toolCount = Number((evt as any).tool_count || 0)
     const goal = String((evt as any).goal || '').trim()
-    const text = String(evt.text || evt.preview || '').trim()
+    const rawText = String(evt.text || evt.preview || '')
+    const text = rawText.trim()
     const summary = String((evt as any).summary || '').trim()
     const duration = Number((evt as any).duration_seconds ?? (evt as any).duration)
 
-    let preview = text || summary || goal
+    let preview = `${label}${goal ? ` · ${goal}` : ''}`
     if (eventName === 'subagent.start') {
-      preview = `subagent ${label} started${goal ? `: ${goal}` : ''}`
+      preview = `${label}${goal ? ` · ${goal}` : ''}`
     } else if (eventName === 'subagent.tool') {
-      const prefix = `subagent ${label}${toolCount ? ` turn ${toolCount}` : ''}`
-      preview = `${prefix}${toolName ? `: ${toolName}` : ''}${text ? ` - ${text}` : ''}`
-    } else if (eventName === 'subagent.progress') {
-      preview = `subagent ${label}: ${text || 'working'}`
+      preview = `${label}${toolCount ? ` · #${toolCount}` : ''}${toolName ? ` · ${toolName}` : ''}${text ? ` · ${text}` : ''}`
+    } else if (eventName === 'subagent.progress' || eventName === 'subagent.text' || eventName === 'subagent.thinking') {
+      preview = `${label}${text ? ` · ${text}` : goal ? ` · ${goal}` : ''}`
     } else if (eventName === 'subagent.complete') {
-      const status = String((evt as any).status || 'completed')
-      preview = `subagent ${label} ${status}${summary ? `: ${summary}` : ''}`
+      preview = `${label}${summary ? ` · ${summary}` : text ? ` · ${text}` : ''}`
     }
 
     const msgs = getSessionMsgs(sessionId)
     const existing = msgs.find(m => m.role === 'tool' && m.toolCallId === toolCallId)
-    const toolStatus = eventName === 'subagent.complete'
-      ? ((evt as any).status && String((evt as any).status) !== 'completed' ? 'error' : 'done')
-      : 'running'
+    const toolStatus = nextStream.status === 'running'
+      ? 'running'
+      : nextStream.status === 'completed' ? 'done' : 'error'
     const update: Partial<Message> = {
       toolName: 'delegate_task',
       toolCallId,
       toolPreview: preview.slice(0, 220),
+      toolArgs: eventName === 'subagent.tool'
+        ? runtimeToolPayloadOrUndefined((evt as any).arguments)
+        : existing?.toolArgs,
       toolStatus,
       toolDuration: Number.isFinite(duration) ? duration : undefined,
       toolResult: eventName === 'subagent.complete'
@@ -1604,8 +2101,9 @@ export const useChatStore = defineStore('chat', () => {
             api_calls: (evt as any).api_calls,
             input_tokens: (evt as any).input_tokens,
             output_tokens: (evt as any).output_tokens,
+            output_tail: (evt as any).output_tail,
           }, null, 2)
-        : undefined,
+        : existing?.toolResult,
     }
 
     if (existing) {
@@ -1620,6 +2118,29 @@ export const useChatStore = defineStore('chat', () => {
       timestamp: Date.now(),
       ...update,
     })
+  }
+
+  function settleInterruptedSubagents(sessionId: string) {
+    const runningStreams = [...subagentStreams.value.values()].filter(stream =>
+      stream.sessionId === sessionId && stream.status === 'running',
+    )
+    for (const stream of runningStreams) {
+      handleSubagentEvent(sessionId, {
+        event: 'subagent.complete',
+        session_id: sessionId,
+        subagent_id: stream.subagentId,
+        task_index: stream.taskIndex,
+        task_count: stream.taskCount,
+        goal: stream.goal,
+        model: stream.model,
+        status: 'interrupted',
+        timestamp: Date.now(),
+      })
+    }
+  }
+
+  function getSubagentStream(sessionId: string, subagentId: string): SubagentStream | null {
+    return subagentStreams.value.get(`${sessionId}:${subagentId}`) || null
   }
 
   function handleMoaEvent(sessionId: string, evt: RunEvent) {
@@ -1747,6 +2268,7 @@ export const useChatStore = defineStore('chat', () => {
       if (target) target.messages = []
       queuedUserMessages.value.delete(sid)
       queueLengths.value.delete(sid)
+      clearMessageReference(sid)
       if ((evt as any).clearHistory) {
         const message = String((evt as any).message || '')
         if (message) {
@@ -1780,6 +2302,7 @@ export const useChatStore = defineStore('chat', () => {
       serverWorking.value.delete(sid)
       queueLengths.value.delete(sid)
       queuedUserMessages.value.delete(sid)
+      clearMessageReference(sid)
       setAbortState(null)
       const msgs = getSessionMsgs(sid)
       msgs.forEach(m => {
@@ -2161,6 +2684,21 @@ export const useChatStore = defineStore('chat', () => {
     }
   }
 
+  function applySessionWorkspaceUpdate(evt: RunEvent) {
+    const sid = evt.session_id
+    const workspace = typeof evt.workspace === 'string' ? evt.workspace.trim() : ''
+    if (!sid || !workspace) return
+    const target = sessions.value.find(s => s.id === sid)
+    if (target) {
+      target.workspace = workspace
+      target.isLocalOnly = false
+    }
+    if (activeSession.value?.id === sid) {
+      activeSession.value.workspace = workspace
+      activeSession.value.isLocalOnly = false
+    }
+  }
+
   function primeCompletionBellIfEnabled() {
     if (useSettingsStore().display.bell_on_complete) {
       primeCompletionSound()
@@ -2180,12 +2718,15 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   function completionNotificationAgent(session: Session): { icon: string } {
-    const codingAgentId = session.codingAgentId || (session.agent === 'codex' ? 'codex' : session.agent === 'claude' ? 'claude-code' : undefined)
+    const codingAgentId = session.codingAgentId || agentToCodingAgentId(session.agent)
     if (codingAgentId === 'codex') {
       return { icon: '/coding-agents/codex-openai.png' }
     }
     if (codingAgentId === 'claude-code') {
       return { icon: '/coding-agents/claude-code.svg' }
+    }
+    if (codingAgentId === 'ekko-agent') {
+      return { icon: '/coding-agents/ekko-agent.png' }
     }
     return { icon: '/coding-agents/hermes.png' }
   }
@@ -2236,9 +2777,14 @@ export const useChatStore = defineStore('chat', () => {
     const isBridgeCompressCommand = isBridgeSlashCommand && /^\/compress(?:\s|$)/i.test(trimmedContent)
     const isBridgePlanCommand = isBridgeSlashCommand && /^\/plan(?:\s|$)/i.test(trimmedContent)
     const isBridgeSkillCommand = isBridgeSlashCommand && /^\/skill(?:\s|$)/i.test(trimmedContent)
+    const isBridgeBundleCommand = isBridgeSlashCommand && /^\/bundles(?:\s|$)/i.test(trimmedContent)
     const isBridgeMoaCommand = isBridgeSlashCommand && /^\/moa(?:\s|$)/i.test(trimmedContent)
     const isBridgeGoalCommand = isBridgeSlashCommand && /^\/goal(?:\s|$)/i.test(trimmedContent)
     const isBridgeForkCommand = isBridgeSlashCommand && /^\/fork(?:\s|$)/i.test(trimmedContent)
+    const messageReference = isBridgeSlashCommand ? null : messageReferences.value.get(sid) || null
+    const submittedContent = messageReference
+      ? formatMessageWithReference(messageReference, trimmedContent)
+      : trimmedContent
     const shouldOptimisticallyShowRunStatus = !isCodingAgentSession && !isBridgeForkCommand
     const wasLiveBeforeSend = isSessionLive(sid)
     if (isBridgeForkCommand) {
@@ -2249,6 +2795,7 @@ export const useChatStore = defineStore('chat', () => {
       !isBridgeSlashCommand ||
       isBridgePlanCommand ||
       isBridgeSkillCommand ||
+      isBridgeBundleCommand ||
       isBridgeMoaCommand
     )
     if (isBridgeSlashCommand && !shouldQueue && !wasLiveBeforeSend) {
@@ -2258,7 +2805,7 @@ export const useChatStore = defineStore('chat', () => {
     const userMsg: Message = {
       id: uid(),
       role: isBridgeSlashCommand ? 'command' : 'user',
-      content: trimmedContent,
+      content: submittedContent,
       timestamp: Date.now(),
       attachments: attachments && attachments.length > 0 ? attachments : undefined,
       queued: shouldQueue,
@@ -2272,6 +2819,7 @@ export const useChatStore = defineStore('chat', () => {
       updateSessionTitle(sid)
       if (shouldOptimisticallyShowRunStatus) serverWorking.value.add(sid)
     }
+    clearMessageReference(sid)
 
     let runSubmitted = false
     try {
@@ -2304,10 +2852,10 @@ export const useChatStore = defineStore('chat', () => {
         }
 
         // Build content blocks with uploaded file paths
-        input = await buildContentBlocks(content, attachments, uploaded)
+        input = await buildContentBlocks(submittedContent, attachments, uploaded)
       } else {
         // No attachments: use plain text format
-        input = trimmedContent
+        input = submittedContent
       }
 
       const appStore = useAppStore()
@@ -2331,11 +2879,12 @@ export const useChatStore = defineStore('chat', () => {
             ? 'api_server'
             : 'cli'
       const isCodingAgentExecution = sessionSource === 'coding_agent' || (sessionSource === 'workflow' && isCodingAgentSession)
-      const codingAgentId: 'claude-code' | 'codex' =
+      const codingAgentId: ChatCodingAgentId =
         activeSession.value?.codingAgentId ||
-        (activeSession.value?.agent === 'codex' ? 'codex' : 'claude-code')
+        agentToCodingAgentId(activeSession.value?.agent) ||
+        'claude-code'
       const codingAgentMode = activeSession.value?.codingAgentMode || 'scoped'
-      const codingAgentApiMode = isCodingAgentExecution && codingAgentMode !== 'global'
+      const codingAgentApiMode = isCodingAgentExecution && codingAgentId !== 'ekko-agent' && codingAgentMode !== 'global'
         ? normalizeCodingAgentApiMode(
             activeSession.value?.apiMode || providerGroup?.api_mode,
             inferCodingAgentApiMode(
@@ -2360,6 +2909,7 @@ export const useChatStore = defineStore('chat', () => {
         })),
         queue_id: userMsg.id,
         workspace: activeSession.value?.workspace || undefined,
+        category_id: activeSession.value?.categoryId ?? null,
         source: sessionSource,
         ...(runtimeMode.value === 'global_agent' ? { session_source: 'global_agent' as const } : {}),
         ...(sessionSource === 'workflow' ? { session_source: 'workflow' as const } : {}),
@@ -2372,9 +2922,13 @@ export const useChatStore = defineStore('chat', () => {
               apiMode: codingAgentApiMode,
             }
           : {}),
-        // Per-session reasoning effort override. Coding Agent runners do not
-        // consume this setting yet, so keep their payloads explicit.
-        reasoning_effort: isCodingAgentExecution ? undefined : activeSession.value?.reasoningEffort || undefined,
+        // Per-session reasoning effort override. Hermes bridge and scoped coding
+        // agents both consume this when the selected provider/API supports it.
+        // Global coding-agent mode uses the user's native CLI config, so avoid
+        // injecting a per-session override there.
+        reasoning_effort: isCodingAgentExecution && codingAgentMode === 'global'
+          ? undefined
+          : activeSession.value?.reasoningEffort || undefined,
       }
       if (shouldSendInitialSessionConfig && activeSession.value) {
         activeSession.value.messageCount = Math.max(activeSession.value.messageCount || 0, 1)
@@ -2520,6 +3074,7 @@ export const useChatStore = defineStore('chat', () => {
                 break
               case 'abort.completed':
                 setAbortState({ aborting: false, synced: (e as any).synced ?? false })
+                settleInterruptedSubagents(sid)
                 break
               case 'approval.requested':
                 setPendingApproval({ ...e, session_id: sid })
@@ -2589,6 +3144,11 @@ export const useChatStore = defineStore('chat', () => {
               break
             }
 
+            case 'session.workspace.updated': {
+              applySessionWorkspaceUpdate(evt)
+              break
+            }
+
             case 'agent.event': {
               handleAgentEvent(evt)
               break
@@ -2646,6 +3206,7 @@ export const useChatStore = defineStore('chat', () => {
 
             case 'abort.completed': {
               setAbortState({ aborting: false, synced: (evt as any).synced ?? false })
+              settleInterruptedSubagents(sid)
               clearPendingInteractions(sid)
               if ((evt as any).queue_length > 0) {
                 queueLengths.value.set(sid, (evt as any).queue_length)
@@ -2761,6 +3322,33 @@ export const useChatStore = defineStore('chat', () => {
               break
             }
 
+            case 'message.interim': {
+              const text = String(evt.text || '')
+              if (!text.trim()) break
+              runProducedAssistantText = true
+              runProducedAssistantContent = true
+              const msgs = getSessionMsgs(sid)
+              const active = activeAssistantMessageId
+                ? msgs.find(m => m.id === activeAssistantMessageId)
+                : null
+              if (active?.role === 'assistant') {
+                active.content = text
+                active.isStreaming = false
+                if (active.reasoning) noteReasoningEnd(active.id)
+              } else {
+                addMessage(sid, {
+                  id: uid(),
+                  role: 'assistant',
+                  content: text,
+                  timestamp: Date.now(),
+                  isStreaming: false,
+                })
+              }
+              activeAssistantMessageId = null
+
+              break
+            }
+
             case 'session.title.updated': {
               applyGeneratedSessionTitle(evt)
               break
@@ -2768,6 +3356,7 @@ export const useChatStore = defineStore('chat', () => {
 
             case 'tool.started': {
               runHadToolActivity = true
+              if (isBackgroundDelegateToolPayload(evt.tool || evt.name, (evt as any).arguments)) break
               const msgs = getSessionMsgs(sid)
               const toolCallId = (evt as any).tool_call_id as string | undefined
               const last = activeAssistantMessageId
@@ -2804,17 +3393,24 @@ export const useChatStore = defineStore('chat', () => {
               break
             }
 
-            case 'tool.completed': {
+            case 'tool.completed':
+            case 'tool.failed': {
               runHadToolActivity = true
               const msgs = getSessionMsgs(sid)
               const toolCallId = (evt as any).tool_call_id as string | undefined
               const toolMsgs = toolCallId
                 ? msgs.filter(m => m.role === 'tool' && m.toolCallId === toolCallId)
                 : msgs.filter(m => m.role === 'tool' && m.toolStatus === 'running')
+              const output = runtimeToolOutputFromEvent(evt)
+              const toolName = evt.tool || evt.name || toolMsgs[toolMsgs.length - 1]?.toolName
+              if (isBackgroundDelegateToolPayload(toolName, output)) {
+                const session = sessions.value.find(item => item.id === sid)
+                if (session) session.messages = session.messages.filter(message => !toolMsgs.includes(message))
+                break
+              }
               if (toolMsgs.length > 0) {
                 const last = toolMsgs[toolMsgs.length - 1]
-                const output = runtimeToolPayloadOrUndefined((evt as any).output)
-                const hasError = (evt as any).error === true || runtimeToolOutputHasError(output)
+                const hasError = evt.event === 'tool.failed' || (evt as any).error === true || runtimeToolOutputHasError(output)
                 const duration = (evt as any).duration
                 updateMessage(sid, last.id, {
                   toolStatus: hasError ? 'error' : 'done',
@@ -2827,14 +3423,17 @@ export const useChatStore = defineStore('chat', () => {
             }
 
             case 'workspace.diff.completed': {
-              handleWorkspaceRunChangeEvent(sid, evt)
+              activeAssistantMessageId = handleWorkspaceRunChangeEvent(sid, evt, activeAssistantMessageId)
               break
             }
 
             case 'subagent.start':
             case 'subagent.tool':
             case 'subagent.progress':
-            case 'subagent.complete': {
+            case 'subagent.text':
+            case 'subagent.thinking':
+            case 'subagent.complete':
+            case 'delegation.updated': {
               runHadToolActivity = true
               handleSubagentEvent(sid, evt)
               break
@@ -2861,8 +3460,6 @@ export const useChatStore = defineStore('chat', () => {
             }
 
             case 'run.completed': {
-              handleTerminalWorkspaceRunChange(sid, evt)
-              clearAgentEventMessages(sid)
               const msgs = getSessionMsgs(sid)
               const lastMsg = activeAssistantMessageId
                 ? msgs.find(m => m.id === activeAssistantMessageId)
@@ -2870,6 +3467,7 @@ export const useChatStore = defineStore('chat', () => {
               const completedAssistantMessageId = lastMsg?.role === 'assistant' && lastMsg.isStreaming
                 ? lastMsg.id
                 : null
+              clearAgentEventMessages(sid)
               if (lastMsg?.isStreaming) {
                 updateMessage(sid, lastMsg.id, { isStreaming: false })
               }
@@ -2975,6 +3573,11 @@ export const useChatStore = defineStore('chat', () => {
                 playCompletionBellIfEnabled()
                 showCompletionNotificationIfEnabled(sid, completedAssistantMessageId)
               }
+              const terminalAssistantMessageId = completedAssistantMessageId || [...getSessionMsgs(sid)]
+                .reverse()
+                .find(message => message.role === 'assistant' && String(message.content || '').trim())
+                ?.id
+              handleTerminalWorkspaceRunChange(sid, evt, terminalAssistantMessageId)
               attachToolChangesToMessages(sid)
 
               // 自动播放语音
@@ -3004,7 +3607,11 @@ export const useChatStore = defineStore('chat', () => {
             }
 
             case 'run.failed': {
-              handleTerminalWorkspaceRunChange(sid, evt)
+              const failedMessages = getSessionMsgs(sid)
+              const failedAssistant = activeAssistantMessageId
+                ? failedMessages.find(message => message.id === activeAssistantMessageId)
+                : [...failedMessages].reverse().find(message => message.role === 'assistant' && message.isStreaming)
+              handleTerminalWorkspaceRunChange(sid, evt, failedAssistant?.id)
               clearAgentEventMessages(sid)
               if ((evt as any).inputTokens != null) {
                 const target = sessions.value.find(s => s.id === sid)
@@ -3103,7 +3710,7 @@ export const useChatStore = defineStore('chat', () => {
    * Emits 'resume' to join the session room on the server,
    * then sets up event listeners to receive ongoing events.
    */
-  function resumeServerWorkingRun(sid: string, force = false) {
+  function resumeServerWorkingRun(sid: string, force = false, passive = false) {
     // Don't register duplicate listeners if already streaming
     if (streamStates.value.has(sid)) return
     // Only set up listeners if the server reported an active run during resume.
@@ -3124,6 +3731,20 @@ export const useChatStore = defineStore('chat', () => {
       serverWorking.value.delete(sid)
       // Unregister from global session handlers
       unregisterSessionHandlers(sid)
+    }
+
+    const markIdleKeepingBackgroundListener = () => {
+      streamStates.value.delete(sid)
+      serverWorking.value.delete(sid)
+    }
+
+    const ensureAbortHandle = () => {
+      if (streamStates.value.has(sid)) return
+      streamStates.value.set(sid, {
+        abort: () => {
+          getChatRunSocket(runtimeTransport())?.emit('abort', { session_id: sid })
+        },
+      })
     }
 
     const closeStreamingAssistant = () => {
@@ -3174,6 +3795,11 @@ export const useChatStore = defineStore('chat', () => {
           break
         }
 
+        case 'session.workspace.updated': {
+          applySessionWorkspaceUpdate(evt)
+          break
+        }
+
         case 'agent.event': {
           handleAgentEvent(evt)
           break
@@ -3187,6 +3813,7 @@ export const useChatStore = defineStore('chat', () => {
         case 'run.started':
           clearSessionCompletedUnread(sid)
           serverWorking.value.add(sid)
+          ensureAbortHandle()
           clearAgentEventMessages(sid)
           setAbortState(null)
           setCompressionState(sid, null)
@@ -3248,6 +3875,7 @@ export const useChatStore = defineStore('chat', () => {
 
         case 'abort.completed': {
           setAbortState({ aborting: false, synced: (evt as any).synced ?? false })
+          settleInterruptedSubagents(sid)
           clearPendingInteractions(sid)
           if ((evt as any).queue_length > 0) {
             queueLengths.value.set(sid, (evt as any).queue_length)
@@ -3355,6 +3983,33 @@ export const useChatStore = defineStore('chat', () => {
           break
         }
 
+        case 'message.interim': {
+          const text = String(evt.text || '')
+          if (!text.trim()) break
+          runProducedAssistantText = true
+          runProducedAssistantContent = true
+          const msgs = getSessionMsgs(sid)
+          const active = activeAssistantMessageId
+            ? msgs.find(m => m.id === activeAssistantMessageId)
+            : null
+          if (active?.role === 'assistant') {
+            active.content = text
+            active.isStreaming = false
+            if (active.reasoning) noteReasoningEnd(active.id)
+          } else {
+            addMessage(sid, {
+              id: uid(),
+              role: 'assistant',
+              content: text,
+              timestamp: Date.now(),
+              isStreaming: false,
+            })
+          }
+          activeAssistantMessageId = null
+
+          break
+        }
+
         case 'session.title.updated': {
           applyGeneratedSessionTitle(evt)
           break
@@ -3362,6 +4017,7 @@ export const useChatStore = defineStore('chat', () => {
 
         case 'tool.started': {
           runHadToolActivity = true
+          if (isBackgroundDelegateToolPayload(evt.tool || evt.name, (evt as any).arguments)) break
           const msgs = getSessionMsgs(sid)
           const toolCallId = (evt as any).tool_call_id as string | undefined
           const last = activeAssistantMessageId
@@ -3398,16 +4054,23 @@ export const useChatStore = defineStore('chat', () => {
           break
         }
 
-        case 'tool.completed': {
+        case 'tool.completed':
+        case 'tool.failed': {
           runHadToolActivity = true
           const msgs = getSessionMsgs(sid)
           const toolCallId = (evt as any).tool_call_id as string | undefined
           const toolMsgs = toolCallId
             ? msgs.filter(m => m.role === 'tool' && m.toolCallId === toolCallId)
             : msgs.filter(m => m.role === 'tool' && m.toolStatus === 'running')
+          const output = runtimeToolOutputFromEvent(evt)
+          const toolName = evt.tool || evt.name || toolMsgs[toolMsgs.length - 1]?.toolName
+          if (isBackgroundDelegateToolPayload(toolName, output)) {
+            const session = sessions.value.find(item => item.id === sid)
+            if (session) session.messages = session.messages.filter(message => !toolMsgs.includes(message))
+            break
+          }
           if (toolMsgs.length > 0) {
-            const output = runtimeToolPayloadOrUndefined((evt as any).output)
-            const hasError = (evt as any).error === true || runtimeToolOutputHasError(output)
+            const hasError = evt.event === 'tool.failed' || (evt as any).error === true || runtimeToolOutputHasError(output)
             updateMessage(sid, toolMsgs[toolMsgs.length - 1].id, {
               toolStatus: hasError ? 'error' : 'done',
               toolDuration: (evt as any).duration,
@@ -3426,7 +4089,10 @@ export const useChatStore = defineStore('chat', () => {
         case 'subagent.start':
         case 'subagent.tool':
         case 'subagent.progress':
-        case 'subagent.complete': {
+        case 'subagent.text':
+        case 'subagent.thinking':
+        case 'subagent.complete':
+        case 'delegation.updated': {
           runHadToolActivity = true
           handleSubagentEvent(sid, evt)
           break
@@ -3456,6 +4122,7 @@ export const useChatStore = defineStore('chat', () => {
           handleTerminalWorkspaceRunChange(sid, evt)
           clearAgentEventMessages(sid)
           const hasQueue = (evt as any).queue_remaining > 0
+          const hasBackground = (evt.background_pending || 0) > 0
           if (hasQueue) {
             queueLengths.value.set(sid, (evt as any).queue_remaining)
           } else {
@@ -3567,15 +4234,21 @@ export const useChatStore = defineStore('chat', () => {
             }
           }
 
-          if (!hasQueue) {
+          if (!hasQueue && !hasBackground) {
             markSessionCompletedUnread(sid)
             cleanup()
             activeAssistantMessageId = null
             reasoningAssistantMessageId = null
             activeRunMarker = null
-          } else {
+          } else if (hasQueue) {
             markSessionCompletedUnread(sid, true)
             // More runs pending — reset for next run but don't cleanup
+            activeAssistantMessageId = null
+            reasoningAssistantMessageId = null
+            activeRunMarker = null
+          } else {
+            markSessionCompletedUnread(sid)
+            markIdleKeepingBackgroundListener()
             activeAssistantMessageId = null
             reasoningAssistantMessageId = null
             activeRunMarker = null
@@ -3596,6 +4269,7 @@ export const useChatStore = defineStore('chat', () => {
             }
           }
           const hasQueue = (evt as any).queue_remaining > 0
+          const hasBackground = (evt.background_pending || 0) > 0
           if (hasQueue) {
             queueLengths.value.set(sid, (evt as any).queue_remaining)
           } else {
@@ -3603,8 +4277,10 @@ export const useChatStore = defineStore('chat', () => {
           }
           addAgentErrorMessage(sid, evt.error)
           settleRunningTools(sid, 'error')
-          if (!hasQueue) {
+          if (!hasQueue && !hasBackground) {
             cleanup()
+          } else if (hasBackground && !hasQueue) {
+            markIdleKeepingBackgroundListener()
           }
           activeAssistantMessageId = null
           reasoningAssistantMessageId = null
@@ -3627,6 +4303,7 @@ export const useChatStore = defineStore('chat', () => {
     // Register handlers in global session map
     registerSessionHandlers(sid, {
       onMessageDelta: (evt) => handleEvent(evt),
+      onMessageInterim: (evt) => handleEvent(evt),
       onReasoningDelta: (evt) => handleEvent(evt),
       onThinkingDelta: (evt) => handleEvent(evt),
       onReasoningAvailable: (evt) => handleEvent(evt),
@@ -3645,6 +4322,7 @@ export const useChatStore = defineStore('chat', () => {
       onUsageUpdated: (evt) => handleEvent(evt),
       onAgentEvent: (evt) => handleEvent(evt),
       onSessionCommand: (evt) => handleEvent(evt),
+      onSessionWorkspaceUpdated: (evt) => handleEvent(evt),
       onRunQueued: (evt) => handleEvent(evt),
       onClarifyRequested: (evt) => handleEvent(evt),
       onClarifyResolved: (evt) => handleEvent(evt),
@@ -3654,12 +4332,10 @@ export const useChatStore = defineStore('chat', () => {
     // Server already joined room and replayed events.
     // Just set up handlers for ongoing streaming events.
 
-    // Mark as streaming so UI shows the indicator and can still abort after refresh.
-    streamStates.value.set(sid, {
-      abort: () => {
-        getChatRunSocket(runtimeTransport())?.emit('abort', { session_id: sid })
-      },
-    })
+    // A passive listener keeps background subagent telemetry alive without
+    // making the parent session look busy. The abort handle is installed when
+    // the completion notification starts its autonomous parent turn.
+    if (!passive) ensureAbortHandle()
   }
 
   function handlePeerUserMessage(evt: RunEvent) {
@@ -3727,6 +4403,7 @@ export const useChatStore = defineStore('chat', () => {
   onSessionCommand(handleGlobalSessionCommand)
 
   onSessionTitleUpdated(applyGeneratedSessionTitle)
+  onSessionWorkspaceUpdated(applySessionWorkspaceUpdate)
 
   function stopStreaming() {
     const sid = activeSessionId.value
@@ -3780,6 +4457,10 @@ export const useChatStore = defineStore('chat', () => {
             }
             if (!data.isWorking) setCompressionState(sid, null)
             if (data.messages?.length && activeSession.value) {
+              if (typeof data.workspace === 'string') {
+                activeSession.value.workspace = data.workspace.trim() || null
+                activeSession.value.isLocalOnly = false
+              }
               activeSession.value.messages = mapHermesMessages(data.messages as any[])
               activeSession.value.loadedMessageCount = data.messageLoadedCount ?? data.messages.length
               activeSession.value.messageTotal = data.messageTotal ?? activeSession.value.messageCount ?? activeSession.value.loadedMessageCount
@@ -3923,15 +4604,22 @@ export const useChatStore = defineStore('chat', () => {
     isSessionCompletedUnread,
     clearSessionCompletedUnread,
     sessionProfileFilter,
+    setSessionProfileFilter,
+    validateSessionProfileFilter,
     compressionState,
     abortState,
     isAborting,
     queueLengths,
     queuedUserMessages,
+    activeMessageReference,
     pendingApprovals,
     activePendingApproval,
     activePendingClarify,
+    subagentStreams,
+    getSubagentStream,
     removeQueuedMessage,
+    setMessageReference,
+    clearMessageReference,
     isLoadingSessions,
     sessionsLoaded,
     isLoadingMessages,

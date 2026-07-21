@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -6,11 +6,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const testState = vi.hoisted(() => ({
   profileDir: '',
   execFile: vi.fn(),
+  resolvedProfiles: [] as string[],
 }))
 
 vi.mock('../../packages/server/src/services/hermes/hermes-profile', () => ({
   getActiveProfileName: () => 'default',
-  getProfileDir: () => testState.profileDir || '/fake/home/.hermes',
+  getProfileDir: (profile: string) => {
+    testState.resolvedProfiles.push(profile)
+    return testState.profileDir || '/fake/home/.hermes'
+  },
 }))
 
 vi.mock('../../packages/server/src/services/hermes/hermes-path', () => ({
@@ -24,7 +28,7 @@ vi.mock('child_process', () => ({
 const mockFetch = vi.fn()
 vi.stubGlobal('fetch', mockFetch)
 
-import { create, pause, remove, resume, run as runJob, update } from '../../packages/server/src/controllers/hermes/jobs'
+import { create, deliveryTargets, pause, remove, resume, run as runJob, update } from '../../packages/server/src/controllers/hermes/jobs'
 
 function createMockCtx(overrides: Record<string, any> = {}) {
   const ctx: any = {
@@ -68,6 +72,7 @@ describe('Hermes jobs controller', () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    testState.resolvedProfiles = []
     tempDir = mkdtempSync(join(tmpdir(), 'hermes-web-ui-jobs-test-'))
     testState.profileDir = tempDir
     testState.execFile.mockImplementation((_bin, _args, _opts, cb) => {
@@ -189,4 +194,105 @@ describe('Hermes jobs controller', () => {
       )
     }
   })
+
+  it('persists selected provider and model after creating a job without unsupported CLI flags', async () => {
+    testState.execFile.mockImplementation((_bin, args, _opts, cb) => {
+      expect(args).not.toContain('--model')
+      expect(args).not.toContain('--provider')
+      const cronDir = join(tempDir, 'cron')
+      mkdirSync(cronDir, { recursive: true })
+      writeFileSync(join(cronDir, 'jobs.json'), JSON.stringify({
+        jobs: [{
+          id: 'created123456',
+          job_id: 'created123456',
+          name: 'daily',
+          schedule: { kind: 'cron', expr: '0 9 * * *', display: '0 9 * * *' },
+          schedule_display: '0 9 * * *',
+          prompt: 'daily summary',
+          repeat: { times: null, completed: 0 },
+        }],
+      }))
+      cb(null, { stdout: '', stderr: '' })
+    })
+
+    const ctx = createMockCtx({
+      request: { body: { name: 'daily', schedule: '0 9 * * *', prompt: 'daily summary', provider: 'openai', model: 'gpt-4.1-mini' } },
+    })
+    await create(ctx)
+
+    expect(ctx.status).toBe(200)
+    expect(ctx.body.job.provider).toBe('openai')
+    expect(ctx.body.job.model).toBe('gpt-4.1-mini')
+    const persisted = JSON.parse(readFileSync(join(tempDir, 'cron', 'jobs.json'), 'utf-8'))
+    expect(persisted.jobs[0].provider).toBe('openai')
+    expect(persisted.jobs[0].model).toBe('gpt-4.1-mini')
+  })
+
+  it('persists selected provider and model after editing a job', async () => {
+    writeExistingJob(tempDir)
+
+    const ctx = createMockCtx({
+      request: { body: { provider: 'anthropic', model: 'claude-sonnet-4' } },
+    })
+    await update(ctx)
+
+    expect(ctx.status).toBe(200)
+    expect(testState.execFile).not.toHaveBeenCalled()
+    expect(ctx.body.job.provider).toBe('anthropic')
+    expect(ctx.body.job.model).toBe('claude-sonnet-4')
+    const persisted = JSON.parse(readFileSync(join(tempDir, 'cron', 'jobs.json'), 'utf-8'))
+    expect(persisted.jobs[0].provider).toBe('anthropic')
+    expect(persisted.jobs[0].model).toBe('claude-sonnet-4')
+  })
+
+  it('returns explicit delivery targets from the selected profile channel directory', () => {
+    writeFileSync(join(tempDir, 'channel_directory.json'), JSON.stringify({
+      updated_at: '2026-07-17T09:15:00+08:00',
+      platforms: {
+        weixin: [
+          { id: 'wx-user@im.wechat', name: '微信私聊', type: 'dm', thread_id: null },
+          { id: 'wx-user@im.wechat', name: '重复项', type: 'dm', thread_id: null },
+        ],
+        feishu: [
+          { id: 'oc_example', name: '研发群', type: 'group' },
+          { id: '', name: 'invalid' },
+        ],
+      },
+    }))
+    const ctx = createMockCtx({ state: { profile: { name: 'research' } } })
+
+    deliveryTargets(ctx)
+
+    expect(testState.resolvedProfiles).toContain('research')
+    expect(ctx.body).toEqual({
+      updated_at: '2026-07-17T09:15:00+08:00',
+      targets: [
+        {
+          platform: 'feishu',
+          id: 'oc_example',
+          name: '研发群',
+          type: 'group',
+          thread_id: null,
+          value: 'feishu:oc_example',
+        },
+        {
+          platform: 'weixin',
+          id: 'wx-user@im.wechat',
+          name: '微信私聊',
+          type: 'dm',
+          thread_id: null,
+          value: 'weixin:wx-user@im.wechat',
+        },
+      ],
+    })
+  })
+
+  it('returns an empty delivery target list when the profile directory is unavailable', () => {
+    const ctx = createMockCtx()
+
+    deliveryTargets(ctx)
+
+    expect(ctx.body).toEqual({ updated_at: null, targets: [] })
+  })
+
 })

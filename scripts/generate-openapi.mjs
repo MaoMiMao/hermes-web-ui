@@ -50,6 +50,7 @@ const tagMappings = {
   'routes/hermes/models.ts': { name: 'Models', description: 'Model configuration' },
   'routes/hermes/providers.ts': { name: 'Providers', description: 'Model provider management' },
   'routes/hermes/skills.ts': { name: 'Skills', description: 'Skill browsing and management' },
+  'routes/hermes/skill-bundles.ts': { name: 'Skill Bundles', description: 'Skill bundle browsing and management' },
   'routes/hermes/plugins.ts': { name: 'Plugins', description: 'Plugin browsing and management' },
   'routes/hermes/memory.ts': { name: 'Memory', description: 'Agent memory files' },
   'routes/hermes/logs.ts': { name: 'Logs', description: 'Log file access' },
@@ -62,7 +63,6 @@ const tagMappings = {
   'routes/hermes/copilot-auth.ts': { name: 'Copilot Auth', description: 'GitHub Copilot OAuth' },
   'routes/hermes/xai-auth.ts': { name: 'xAI Auth', description: 'xAI OAuth' },
   'routes/hermes/anthropic-auth.ts': { name: 'Anthropic Auth', description: 'Anthropic OAuth' },
-  'routes/hermes/gemini-auth.ts': { name: 'Gemini Auth', description: 'Google Gemini OAuth' },
   'routes/hermes/group-chat.ts': { name: 'Group Chat', description: 'Group chat management' },
   'routes/hermes/chat-run.ts': { name: 'Chat Run', description: 'Chat run HTTP and Socket.IO bridge operations' },
   'routes/hermes/config.ts': { name: 'Config', description: 'Configuration management' },
@@ -75,6 +75,7 @@ const tagMappings = {
   'routes/hermes/runtime-versions.ts': { name: 'Runtime Versions', description: 'Runtime and Web UI version management' },
   'routes/hermes/write-gate.ts': { name: 'Write Gate', description: 'Hermes Agent write approval review' },
   'routes/hermes/performance-monitor.ts': { name: 'Performance', description: 'Runtime performance monitoring' },
+  'routes/hermes/journey.ts': { name: 'Journey', description: 'Hermes Agent learning journey graph' },
   'routes/hermes/terminal.ts': { name: 'Terminal', description: 'WebSocket terminal' },
   'routes/health.ts': { name: 'Health', description: 'Health check' },
   'routes/update.ts': { name: 'Update', description: 'Self-update management' },
@@ -607,6 +608,9 @@ function schemaFromType(type) {
   const schema = {}
 
   if (/\bnull\b/.test(normalized)) schema.nullable = true
+  if (/SessionProviderApiMode|CodingAgentApiMode/.test(normalized)) {
+    return { ...schema, type: 'string', enum: ['chat_completions', 'codex_responses', 'anthropic_messages'] }
+  }
   if (/string\[\]|Array<string>/.test(normalized)) {
     return { ...schema, type: 'array', items: { type: 'string' } }
   }
@@ -714,6 +718,11 @@ function generateResponses(path, method) {
 
   if (method === 'post' || method === 'put' || method === 'patch') {
     responses['400'] = { $ref: '#/components/responses/BadRequest' }
+  }
+
+  if (path === '/api/hermes/group-chat/rooms/:roomId/workspace') {
+    responses['403'] = { description: 'Forbidden - Workspace folder is not allowed' }
+    responses['404'] = { $ref: '#/components/responses/NotFound' }
   }
 
   return responses

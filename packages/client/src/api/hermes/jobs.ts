@@ -69,6 +69,8 @@ export interface CreateJobRequest {
   deliver?: string
   skills?: string[]
   repeat?: number
+  model?: string
+  provider?: string
 }
 
 export interface UpdateJobRequest {
@@ -91,6 +93,22 @@ export interface JobFormValues {
   deliver: string
   skills: string[]
   repeat_times: number | null
+  model: string
+  provider: string
+}
+
+export interface JobDeliveryTarget {
+  platform: string
+  id: string
+  name: string
+  type: string | null
+  thread_id: string | null
+  value: string
+}
+
+export interface JobDeliveryTargetsResponse {
+  updated_at: string | null
+  targets: JobDeliveryTarget[]
 }
 
 function unwrap(res: { job: Job }): Job {
@@ -138,6 +156,8 @@ export function buildJobUpdateRequest(original: Job, form: JobFormValues): Updat
   const originalRepeat = jobRepeatToEditValue(original.repeat)
   const originalDeliver = original.deliver || 'origin'
   const originalSkills = original.skills || (original.skill ? [original.skill] : [])
+  const originalModel = original.model || ''
+  const originalProvider = original.provider || ''
 
   if (form.name !== original.name) payload.name = form.name
   if (form.schedule !== originalSchedule) payload.schedule = form.schedule
@@ -147,6 +167,8 @@ export function buildJobUpdateRequest(original: Job, form: JobFormValues): Updat
     payload.skills = form.skills
   }
   if (form.repeat_times !== originalRepeat) payload.repeat = form.repeat_times
+  if (form.model !== originalModel) payload.model = form.model
+  if (form.provider !== originalProvider) payload.provider = form.provider
 
   return payload
 }
@@ -154,6 +176,10 @@ export function buildJobUpdateRequest(original: Job, form: JobFormValues): Updat
 export async function listJobs(): Promise<Job[]> {
   const res = await request<{ jobs: Job[] }>('/api/hermes/jobs?include_disabled=true')
   return res.jobs
+}
+
+export async function listJobDeliveryTargets(): Promise<JobDeliveryTargetsResponse> {
+  return request<JobDeliveryTargetsResponse>('/api/hermes/jobs/delivery-targets')
 }
 
 export async function getJob(jobId: string): Promise<Job> {

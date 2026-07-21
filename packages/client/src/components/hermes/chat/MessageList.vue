@@ -20,9 +20,16 @@ import { useI18n } from "vue-i18n";
 import { NButton, NInput } from "naive-ui";
 import VirtualMessageList from "./VirtualMessageList.vue";
 import MessageItem from "./MessageItem.vue";
-import { LIVE_CHAT_MAX_LOADED_MESSAGES, useChatStore, type Message } from "@/stores/hermes/chat";
+import { LIVE_CHAT_MAX_LOADED_MESSAGES, parseMessageReference, useChatStore, type Message } from "@/stores/hermes/chat";
 import thinkingImage from "@/assets/thinking.gif";
 import { useToolTraceVisibility } from "@/composables/useToolTraceVisibility";
+import { openSubagentStream, subagentIdFromToolCall } from "@/utils/hermes/subagent-stream";
+
+const props = withDefaults(defineProps<{
+  approvalPortalToBody?: boolean
+}>(), {
+  approvalPortalToBody: false,
+})
 
 const chatStore = useChatStore();
 const { t } = useI18n();
@@ -52,6 +59,15 @@ function formatToolDuration(seconds: number): string {
 function toolPreviewText(preview?: string): string {
   const text = String(preview || '')
   return text.length > 160 ? `${text.slice(0, 157)}...` : text
+}
+
+function isSubagentToolCall(message: Message): boolean {
+  return subagentIdFromToolCall(message.toolCallId) !== null
+}
+
+function handleToolCallClick(message: Message) {
+  if (!isSubagentToolCall(message)) return
+  openSubagentStream(chatStore.activeSessionId, message.toolCallId)
 }
 
 function formatElapsed(ms: number): string {
@@ -95,7 +111,7 @@ const visibleToolCalls = computed(() =>
 
 const emptyState = computed(() => {
   const session = chatStore.activeSession;
-  const codingAgentId = session?.codingAgentId || (session?.agent === "codex" ? "codex" : session?.agent === "claude" ? "claude-code" : undefined);
+  const codingAgentId = session?.codingAgentId || (session?.agent === "codex" ? "codex" : session?.agent === "claude" ? "claude-code" : session?.agent === "ekko-agent" ? "ekko-agent" : undefined);
   if (codingAgentId === "codex") {
     return {
       logo: "/coding-agents/codex-openai.png",
@@ -108,6 +124,13 @@ const emptyState = computed(() => {
       logo: "/coding-agents/claude-code.svg",
       alt: "Claude Code",
       text: t("chat.emptyStateAgent", { agent: "Claude Code" }),
+    };
+  }
+  if (codingAgentId === "ekko-agent") {
+    return {
+      logo: "/coding-agents/ekko-agent.png",
+      alt: "Ekko Agent",
+      text: t("chat.emptyStateAgent", { agent: "Ekko Agent" }),
     };
   }
   return {
@@ -247,7 +270,9 @@ function removeQueuedMessage(messageId: string) {
 }
 
 function queuedPreview(content: string): string {
-  const normalized = content.replace(/\s+/g, " ").trim();
+  const reference = parseMessageReference(content);
+  const visibleContent = reference?.reply || reference?.content || content;
+  const normalized = visibleContent.replace(/\s+/g, " ").trim();
   return normalized.length > 48 ? `${normalized.slice(0, 48)}...` : normalized;
 }
 
@@ -627,6 +652,13 @@ defineExpose({
               v-for="tc in visibleToolCalls"
               :key="tc.id"
               class="tool-call-item"
+              :class="{ 'subagent-entry': isSubagentToolCall(tc) }"
+              :role="isSubagentToolCall(tc) ? 'button' : undefined"
+              :tabindex="isSubagentToolCall(tc) ? 0 : undefined"
+              :title="isSubagentToolCall(tc) ? t('subagent.open') : undefined"
+              @click="handleToolCallClick(tc)"
+              @keydown.enter.prevent="handleToolCallClick(tc)"
+              @keydown.space.prevent="handleToolCallClick(tc)"
             >
               <svg
                 width="12"
@@ -648,7 +680,7 @@ defineExpose({
                 :title="tc.toolPreview"
               >{{ toolPreviewText(tc.toolPreview) }}</span>
               <span
-                v-if="tc.toolDuration && tc.toolStatus !== 'running'"
+                v-if="tc.toolDuration !== undefined && tc.toolStatus !== 'running'"
                 class="tool-call-duration"
                 :title="$t('chat.executionDuration')"
               >{{ formatToolDuration(tc.toolDuration) }}</span
@@ -725,8 +757,13 @@ defineExpose({
       v-if="visibleApproval || visibleClarify || queuedMessages.length > 0"
       class="message-float-stack"
     >
+    <Teleport to="body" :disabled="!props.approvalPortalToBody">
       <Transition name="queue-float">
-        <div v-if="visibleApproval" class="approval-float-panel">
+        <div
+          v-if="visibleApproval"
+          class="approval-float-panel"
+          :class="{ 'approval-float-panel--global': props.approvalPortalToBody }"
+        >
           <div class="float-panel-header">
             <span class="approval-float-icon" aria-hidden="true">
               <svg
@@ -793,6 +830,7 @@ defineExpose({
           </div>
         </div>
       </Transition>
+    </Teleport>
       <Transition name="queue-float">
         <div v-if="!visibleApproval && visibleClarify" class="approval-float-panel">
           <div class="float-panel-header">
@@ -950,6 +988,14 @@ defineExpose({
 
 .approval-float-panel {
   border-color: rgba(var(--accent-primary-rgb), 0.24);
+}
+
+.approval-float-panel--global {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 2147483000;
+  width: min(720px, calc(100vw - 32px));
 }
 
 .queue-float-panel {
@@ -1166,6 +1212,13 @@ defineExpose({
   .queue-float-panel {
     padding: 7px;
     border-radius: 14px;
+  }
+
+  .approval-float-panel--global {
+    left: 8px;
+    right: 8px;
+    bottom: max(8px, env(safe-area-inset-bottom));
+    width: auto;
   }
 
   .queue-float-header {
@@ -1539,6 +1592,16 @@ defineExpose({
   padding: 3px 8px;
   background: rgba(0, 0, 0, 0.03);
   border-radius: $radius-sm;
+
+  &.subagent-entry {
+    cursor: pointer;
+
+    &:hover,
+    &:focus-visible {
+      outline: none;
+      background: rgba(var(--accent-primary-rgb), 0.09);
+    }
+  }
 
   .dark & {
     background: rgba(255, 255, 255, 0.06);

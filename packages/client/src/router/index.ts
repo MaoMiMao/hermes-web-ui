@@ -89,6 +89,11 @@ const router = createRouter({
       meta: { requiresSuperAdmin: true },
     },
     {
+      path: '/hermes/journey',
+      name: 'hermes.journey',
+      component: () => import('@/views/hermes/JourneyView.vue'),
+    },
+    {
       path: '/hermes/skills-usage',
       name: 'hermes.skillsUsage',
       component: () => import('@/views/hermes/SkillsUsageView.vue'),
@@ -179,13 +184,19 @@ async function ensureDesktopAuth(): Promise<void> {
   }
 }
 
+function isDesktopShell(): boolean {
+  return (window as typeof window & {
+    hermesDesktop?: { isDesktop?: boolean }
+  }).hermesDesktop?.isDesktop === true
+}
+
 router.beforeEach(async (to, _from, next) => {
   await ensureDesktopAuth()
 
   // Public pages don't need auth
   if (to.meta.public) {
     // Already has key, skip login
-    if (to.name === 'login' && hasApiKey()) {
+    if (to.name === 'login' && hasApiKey() && !isDesktopShell()) {
       next({ path: '/hermes/chat' })
       return
     }
