@@ -12,6 +12,7 @@ import { NButton, NTooltip, NModal, NInputNumber, NPopover, NSlider, NDropdown, 
 import { computed, ref, nextTick, onMounted, onUnmounted, watch, h } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useToolTraceVisibility } from '@/composables/useToolTraceVisibility'
+import { extractClipboardFiles } from '@/utils/clipboard-files'
 import VoiceDialogueControls from './VoiceDialogueControls.vue'
 import BundleCreateModal from './BundleCreateModal.vue'
 import { useMicRecorder } from '@/composables/useMicRecorder'
@@ -183,6 +184,12 @@ function backendTranscribeOptions(): {
   if (sttSettings.provider.value === 'doubao') {
     return {
       provider: 'doubao',
+    }
+  }
+
+  if (sttSettings.provider.value !== 'browser') {
+    return {
+      provider: sttSettings.provider.value,
     }
   }
 
@@ -890,7 +897,7 @@ function formatTokens(n: number): string {
 
 // --- File attachment helpers ---
 
-function addFile(file: File) {
+function addFile(file: File, context?: string) {
   if (attachments.value.find(a => a.name === file.name)) return
   const id = Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
   const url = URL.createObjectURL(file)
@@ -901,12 +908,18 @@ function addFile(file: File) {
     size: file.size,
     url,
     file,
+    ...(context?.trim() ? { context: context.trim() } : {}),
   })
 }
 
 function addFiles(files: File[]) {
   for (const file of files) addFile(file)
   if (files.length > 0) textareaRef.value?.focus()
+}
+
+function addBrowserAttachment(file: File, context: string) {
+  addFile(file, context)
+  textareaRef.value?.focus()
 }
 
 function handleAttachClick() {
@@ -920,20 +933,13 @@ function handleFileChange(e: Event) {
   input.value = ''
 }
 
-// --- Paste image ---
+// --- Paste files ---
 
 function handlePaste(e: ClipboardEvent) {
-  const items = Array.from(e.clipboardData?.items || [])
-  const imageItems = items.filter(i => i.type.startsWith('image/'))
-  if (!imageItems.length) return
+  const files = extractClipboardFiles(e.clipboardData)
+  if (!files.length) return
   e.preventDefault()
-  for (const item of imageItems) {
-    const blob = item.getAsFile()
-    if (!blob) continue
-    const ext = item.type.split('/')[1] || 'png'
-    const file = new File([blob], `pasted-${Date.now()}.${ext}`, { type: item.type })
-    addFiles([file])
-  }
+  addFiles(files)
 }
 
 // --- Drag and drop ---
@@ -967,7 +973,7 @@ function handleDrop(e: DragEvent) {
   addFiles(files)
 }
 
-defineExpose({ addFiles })
+defineExpose({ addFiles, addBrowserAttachment })
 
 // --- Send ---
 
@@ -1205,7 +1211,7 @@ function isImage(type: string): boolean {
         v-for="att in attachments"
         :key="att.id"
         class="attachment-preview"
-        :class="{ image: isImage(att.type) }"
+        :class="{ image: isImage(att.type), 'has-context': !!att.context }"
       >
         <template v-if="isImage(att.type)">
           <img :src="att.url" :alt="att.name" class="attachment-thumb" />
@@ -1217,6 +1223,10 @@ function isImage(type: string): boolean {
             <span class="file-size">{{ formatSize(att.size) }}</span>
           </div>
         </template>
+        <details v-if="att.context" class="attachment-context">
+          <summary>{{ t('browser.selectionData') }}</summary>
+          <pre>{{ att.context }}</pre>
+        </details>
         <button class="attachment-remove" @click="removeAttachment(att.id)">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
@@ -1290,6 +1300,7 @@ function isImage(type: string): boolean {
         ref="textareaRef"
         v-model="inputText"
         class="input-textarea"
+        dir="auto"
         :style="textareaHeight ? { height: textareaHeight + 'px' } : {}"
         :placeholder="t('chat.inputPlaceholder')"
         rows="1"
@@ -1674,7 +1685,7 @@ function isImage(type: string): boolean {
   align-items: center;
   gap: 5px;
   padding: 0 0 0 2px;
-  margin-left: 0;
+  margin-inline-start: 0;
 
   .switch-label {
     display: flex;
@@ -1692,7 +1703,7 @@ function isImage(type: string): boolean {
 
   :deep(.n-switch),
   :deep(.n-switch__rail) {
-    margin-right: 0;
+    margin-inline-end: 0;
   }
 }
 
@@ -1704,7 +1715,7 @@ function isImage(type: string): boolean {
   width: 24px;
   min-width: 24px;
   height: 22px;
-  margin-left: 0;
+  margin-inline-start: 0;
   padding: 0;
   background: transparent !important;
   opacity: 1;
@@ -1950,12 +1961,13 @@ function isImage(type: string): boolean {
   min-width: 0;
   max-width: calc(100% - 28px);
   padding: 0;
+  color: $text-muted;
   pointer-events: auto;
 }
 
 .context-info {
   font-size: 11px;
-  color: $text-muted;
+  color: inherit;
   min-width: 0;
   white-space: nowrap;
 
@@ -1980,15 +1992,19 @@ function isImage(type: string): boolean {
 .context-bar {
   width: 60px;
   height: 4px;
-  margin-left: -4px;
-  background: rgba(128, 128, 128, 0.2);
+  margin-inline-start: -4px;
+  background: rgba(var(--text-muted-rgb), 0.2);
   border-radius: 2px;
   overflow: hidden;
 }
 
 .context-bar-fill {
   height: 100%;
-  background: linear-gradient(90deg, rgba(128, 128, 128, 0.3), rgba(128, 128, 128, 0.6));
+  background: linear-gradient(
+    90deg,
+    rgba(var(--text-muted-rgb), 0.45),
+    rgba(var(--text-muted-rgb), 0.85)
+  );
   border-radius: 2px;
   transition: width 0.3s ease;
 
@@ -2001,29 +2017,25 @@ function isImage(type: string): boolean {
   }
 }
 
-.dark .context-info {
-  color: rgba(255, 255, 255, 0.68);
-
-  &.context-warning {
-    color: #f0bc58;
-  }
-}
-
 .dark .context-limit-editable {
-  color: rgba(255, 255, 255, 0.8);
+  color: var(--text-secondary);
 
   &:hover {
-    border-bottom-color: rgba(255, 255, 255, 0.58);
-    background: rgba(255, 255, 255, 0.08);
+    border-bottom-color: var(--text-muted);
+    background: rgba(var(--text-muted-rgb), 0.1);
   }
 }
 
 .dark .context-bar {
-  background: rgba(255, 255, 255, 0.18);
+  background: rgba(var(--text-muted-rgb), 0.2);
 }
 
 .dark .context-bar-fill {
-  background: linear-gradient(90deg, rgba(255, 255, 255, 0.42), rgba(255, 255, 255, 0.72));
+  background: linear-gradient(
+    90deg,
+    rgba(var(--text-muted-rgb), 0.5),
+    rgba(var(--text-muted-rgb), 0.9)
+  );
 
   &.context-bar-warn {
     background: linear-gradient(90deg, #d99d35, #f0bc58);
@@ -2116,12 +2128,36 @@ function isImage(type: string): boolean {
     width: 64px;
     height: 64px;
   }
+
+  &.image.has-context {
+    width: min(420px, 100%);
+    height: auto;
+  }
 }
 
 .attachment-thumb {
   width: 100%;
   height: 100%;
   object-fit: cover;
+}
+
+.attachment-preview.has-context .attachment-thumb {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 220px;
+  object-fit: contain;
+  background: #fff;
+}
+
+.attachment-context {
+  padding: 7px 9px;
+  border-top: 1px solid $border-color;
+  font-size: 11px;
+  color: $text-secondary;
+
+  summary { cursor: pointer; user-select: none; }
+  pre { max-height: 180px; margin: 8px 0 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 10px/1.45 monospace; }
 }
 
 .attachment-file {
@@ -2183,7 +2219,7 @@ function isImage(type: string): boolean {
   width: 100%;
   min-height: 150px;
   background-color: $bg-card;
-  border: 1px solid $border-color;
+  border: 1px solid var(--input-border-color);
   border-radius: 18px;
   padding: 22px 12px 9px;
   position: relative;
@@ -2192,8 +2228,12 @@ function isImage(type: string): boolean {
   transition: border-color $transition-fast, box-shadow $transition-fast;
 
   &:focus-within {
-    border-color: rgba(var(--text-primary-rgb), 0.22);
+    border-color: var(--input-border-focus-color);
     box-shadow: 0 10px 32px rgba(0, 0, 0, 0.11);
+  }
+
+  &:hover:not(:focus-within) {
+    border-color: var(--input-border-hover-color);
   }
 
   &.drag-over {
@@ -2244,7 +2284,8 @@ function isImage(type: string): boolean {
   }
 
   &::placeholder {
-    color: $text-muted;
+    color: var(--input-placeholder-color);
+    opacity: 1;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -2468,7 +2509,7 @@ function isImage(type: string): boolean {
   border-radius: $radius-sm;
   background: $bg-secondary;
   color: $text-primary;
-  text-align: left;
+  text-align: start;
   cursor: pointer;
   overflow: hidden;
   outline: none;
@@ -2496,7 +2537,7 @@ function isImage(type: string): boolean {
   border: 0;
   background: transparent;
   color: inherit;
-  text-align: left;
+  text-align: start;
   cursor: pointer;
   outline: none;
 }

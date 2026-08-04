@@ -13,6 +13,9 @@ import {
     getStoredUserName,
     type RoomInfo,
     type RoomAgent,
+    type RoomAgentInput,
+    type RoomSummaryConfig,
+    type RoomSummaryState,
     type ChatMessage,
     type GroupWorkspaceDiffPayload,
     type MemberInfo,
@@ -21,6 +24,7 @@ import {
     getRoomDetail,
     joinRoomByCode,
     addAgent,
+    updateAgent,
     listAgents,
     removeAgent,
     cloneRoom as cloneRoomApi,
@@ -151,6 +155,7 @@ export const useGroupChatStore = defineStore('groupChat', () => {
     const error = ref<string | null>(null)
     const typingUsers = ref<Map<string, { name: string; timer: ReturnType<typeof setTimeout> }>>(new Map())
     const contextStatuses = ref<Map<string, { agentName: string; status: string }>>(new Map())
+    const roomSummaryStates = ref<Map<string, RoomSummaryState>>(new Map())
     const autoPlaySpeechEnabled = ref(false)
     const pendingApprovals = ref<Map<string, GroupPendingApproval>>(new Map())
     const totalMessages = ref(0)
@@ -192,9 +197,9 @@ const currentUserAvatar = ref('')
         messageReferences.value = next
     }
 
-    function playMessageSpeech(messageId: string, content: string) {
+    function playMessageSpeech(messageId: string, content: string, profile: string) {
         window.dispatchEvent(new CustomEvent('auto-play-speech', {
-            detail: { messageId, content },
+            detail: { messageId, content, profile },
         }))
     }
 
@@ -221,6 +226,24 @@ const currentUserAvatar = ref('')
         setTimeout(() => {
             void recoverMissingFinalContent(roomId, messageId)
         }, STREAM_FINAL_CONTENT_RECOVERY_DELAY_MS)
+    }
+
+    function settleAgentActivity(agentName: string) {
+        contextStatuses.value.delete(agentName)
+        messages.value = messages.value
+            .map(m => (
+                m.senderName === agentName && m.isStreaming
+                    ? { ...m, isStreaming: false }
+                    : m
+            ))
+            .filter(m => !(
+                m.senderName === agentName &&
+                m.role !== 'tool' &&
+                !m.content?.trim() &&
+                !m.reasoning?.trim() &&
+                !m.tool_calls?.length
+            ))
+        contextStatuses.value = new Map(contextStatuses.value)
     }
 
     // Computed: returns first active status for backward compat
@@ -328,14 +351,17 @@ const currentUserAvatar = ref('')
 
     async function joinRealtimeRoom(roomId: string, options: { syncMessages?: boolean; inviteCode?: string } = {}) {
         const socket = await ensureRealtimeSocket()
+        // Browser storage is only a first-join default. Once the member row
+        // exists, the server keeps the room-specific profile authoritative.
         const storedName = getStoredGroupUserName()
+        const storedDescription = localStorage.getItem('gc_user_description')
 
         await new Promise<void>((resolve) => {
             socket.emit('join', {
                 roomId,
                 inviteCode: options.inviteCode,
                 name: storedName || undefined,
-                description: localStorage.getItem('gc_user_description') || undefined,
+                description: storedDescription || undefined,
             }, (res: any) => {
                 if (currentRoomId.value !== roomId) {
                     resolve()
@@ -413,6 +439,16 @@ const currentUserAvatar = ref('')
 
         socket.on('message', (msg: ChatMessage) => {
             if (msg.roomId === currentRoomId.value) {
+                if (msg.role === 'assistant' && msg.tool_calls?.length) {
+                    const responseRunId = inferredGroupResponseRunId(msg)
+                    messages.value = messages.value.map(message => (
+                        message.isStreaming &&
+                        message.senderId === msg.senderId &&
+                        inferredGroupResponseRunId(message) === responseRunId
+                            ? { ...message, reasoning: '', reasoning_content: '' }
+                            : message
+                    ))
+                }
                 const idx = messages.value.findIndex(m => m.id === msg.id)
                 const existing = idx >= 0 ? messages.value[idx] : null
                 const resolvedMsg = mergeFinalMessage(existing, msg)
@@ -425,7 +461,11 @@ const currentUserAvatar = ref('')
                     totalMessages.value = Math.max(totalMessages.value + 1, loadedMessageCount.value)
                 }
                 if (autoPlaySpeechEnabled.value && resolvedMsg.role === 'assistant' && resolvedMsg.content?.trim()) {
-                    setTimeout(() => playMessageSpeech(resolvedMsg.id, resolvedMsg.content), 300)
+                    const messageAgent = agents.value.find(agent =>
+                        agent.agentId === resolvedMsg.senderId || agent.name === resolvedMsg.senderName
+                    )
+                    const profile = messageAgent?.profile || getActiveProfileName() || 'default'
+                    setTimeout(() => playMessageSpeech(resolvedMsg.id, resolvedMsg.content, profile), 300)
                 }
             }
         })
@@ -521,6 +561,14 @@ const currentUserAvatar = ref('')
             }
         })
 
+        socket.on('member_updated', (data: { roomId: string; members: MemberInfo[] }) => {
+            if (data.roomId === currentRoomId.value) {
+                members.value = data.members
+                const currentMember = members.value.find(member => member.userId === userId.value)
+                if (currentMember?.name) userName.value = currentMember.name
+            }
+        })
+
         socket.on('typing', (data: { roomId: string; userId: string; userName: string }) => {
             if (data.roomId === currentRoomId.value && !typingUsers.value.has(data.userId)) {
                 const timer = setTimeout(() => typingUsers.value.delete(data.userId), 5000)
@@ -539,25 +587,19 @@ const currentUserAvatar = ref('')
         socket.on('context_status', (data: { roomId: string; agentName: string; status: string }) => {
             if (data.roomId === currentRoomId.value) {
                 if (data.status === 'ready') {
-                    contextStatuses.value.delete(data.agentName)
-                    messages.value = messages.value
-                        .map(m => (
-                            m.senderName === data.agentName && m.isStreaming
-                                ? { ...m, isStreaming: false }
-                                : m
-                        ))
-                        .filter(m => !(
-                            m.senderName === data.agentName &&
-                            !m.content?.trim() &&
-                            !m.reasoning?.trim() &&
-                            !m.tool_calls?.length
-                        ))
+                    settleAgentActivity(data.agentName)
                 } else {
                     contextStatuses.value.set(data.agentName, { agentName: data.agentName, status: data.status })
+                    // Trigger reactivity
+                    contextStatuses.value = new Map(contextStatuses.value)
                 }
-                // Trigger reactivity
-                contextStatuses.value = new Map(contextStatuses.value)
             }
+        })
+
+        socket.on('room_summary_updated', (summary: RoomSummaryState) => {
+            if (!summary?.roomId) return
+            roomSummaryStates.value.set(summary.roomId, summary)
+            roomSummaryStates.value = new Map(roomSummaryStates.value)
         })
 
         socket.on('approval.requested', (data: { roomId: string; agentName?: string; approval_id?: string; command?: string; description?: string; choices?: string[]; allow_permanent?: boolean }) => {
@@ -592,14 +634,22 @@ const currentUserAvatar = ref('')
             pendingApprovals.value = new Map(pendingApprovals.value)
         })
 
-        socket.on('room_updated', (data: { roomId: string; totalTokens: number }) => {
+        socket.on('room_updated', (data: { roomId: string; totalTokens?: number; name?: string }) => {
             const room = rooms.value.find(r => r.id === data.roomId)
-            if (room) room.totalTokens = data.totalTokens
+            if (!room) return
+            if (typeof data.totalTokens === 'number') room.totalTokens = data.totalTokens
+            if (typeof data.name === 'string' && data.name.trim()) {
+                room.name = data.name.trim()
+                if (currentRoomId.value === data.roomId) roomName.value = room.name
+            }
+            rooms.value = [...rooms.value]
         })
 
         socket.on('room_cleared', (data: { roomId: string; totalTokens: number }) => {
             const room = rooms.value.find(r => r.id === data.roomId)
             if (room) room.totalTokens = data.totalTokens
+            roomSummaryStates.value.delete(data.roomId)
+            roomSummaryStates.value = new Map(roomSummaryStates.value)
             if (data.roomId === currentRoomId.value) {
                 messages.value = []
                 resetMessagePaging()
@@ -621,6 +671,7 @@ const currentUserAvatar = ref('')
         roomName.value = ''
         typingUsers.value.clear()
         contextStatuses.value.clear()
+        roomSummaryStates.value.clear()
         pendingApprovals.value.clear()
     }
 
@@ -628,6 +679,32 @@ const currentUserAvatar = ref('')
         userName.value = name
         localStorage.setItem('gc_user_name', name)
         localStorage.setItem('gc_user_description', description)
+    }
+
+    async function updateCurrentMemberProfile(name: string, description = '') {
+        const roomId = currentRoomId.value
+        const socket = getSocket()
+        const normalizedName = name.trim()
+        const normalizedDescription = description.trim()
+        if (!roomId || !socket) throw new Error('Join a room before updating your profile')
+        if (!normalizedName) throw new Error('Name is required')
+
+        await new Promise<void>((resolve, reject) => {
+            socket.emit('update_member_profile', {
+                roomId,
+                name: normalizedName,
+                description: normalizedDescription,
+            }, (res: { error?: string; members?: MemberInfo[] }) => {
+                if (res?.error) {
+                    reject(new Error(res.error))
+                    return
+                }
+                if (res?.members) members.value = res.members
+                userName.value = normalizedName
+                setUserInfo(normalizedName, normalizedDescription)
+                resolve()
+            })
+        })
     }
 
     // ─── Room Actions ──────────────────────────────────────
@@ -733,13 +810,28 @@ const currentUserAvatar = ref('')
         }
     }
 
-    async function createNewRoom(name: string, inviteCode: string, agentList?: { profile: string; name?: string; description?: string; invited?: boolean }[], compression?: { triggerTokens: number; maxHistoryTokens: number; tailMessageCount: number }, workspace?: string) {
+    async function createNewRoom(
+        name: string,
+        inviteCode: string,
+        agentList?: RoomAgentInput[],
+        summary?: RoomSummaryConfig,
+        workspace?: string,
+        memberProfile?: { name: string; description?: string },
+    ) {
         try {
             const res = await createRoom({
                 name,
                 inviteCode,
+                memberName: memberProfile?.name,
+                memberDescription: memberProfile?.description,
                 agents: agentList,
-                compression: compression || { triggerTokens: 100000, maxHistoryTokens: 32000, tailMessageCount: 10 },
+                summary: {
+                    profile: summary?.summaryProfile || getActiveProfileName() || 'default',
+                    provider: summary?.summaryProvider || '',
+                    model: summary?.summaryModel || '',
+                    apiMode: summary?.summaryApiMode || 'chat_completions',
+                    everyTurns: summary?.summaryEveryTurns || 20,
+                },
                 workspace: workspace || undefined,
             })
             upsertRoom(res.room)
@@ -770,6 +862,8 @@ const currentUserAvatar = ref('')
         try {
             await deleteRoomApi(roomId)
             rooms.value = rooms.value.filter(r => r.id !== roomId)
+            roomSummaryStates.value.delete(roomId)
+            roomSummaryStates.value = new Map(roomSummaryStates.value)
             clearMessageReference(roomId)
             if (currentRoomId.value === roomId) {
                 currentRoomId.value = null
@@ -806,6 +900,8 @@ const currentUserAvatar = ref('')
             resetMessagePaging()
             typingUsers.value.clear()
             contextStatuses.value.clear()
+            roomSummaryStates.value.delete(roomId)
+            roomSummaryStates.value = new Map(roomSummaryStates.value)
             const idx = rooms.value.findIndex(r => r.id === currentRoomId.value)
             if (idx >= 0 && res.room) rooms.value[idx] = res.room
             return res
@@ -854,10 +950,24 @@ const currentUserAvatar = ref('')
         } catch { /* ignore */ }
     }
 
-    async function addAgentToRoom(roomId: string, data: { profile: string; name?: string; description?: string; invited?: boolean }) {
+    async function addAgentToRoom(roomId: string, data: RoomAgentInput) {
         try {
             const res = await addAgent(roomId, data)
             agents.value.push(res.agent)
+            return res.agent
+        } catch (err: any) {
+            error.value = err.message
+            throw err
+        }
+    }
+
+    async function updateAgentInRoom(roomId: string, agentId: string, data: RoomAgentInput) {
+        try {
+            const res = await updateAgent(roomId, agentId, data)
+            agents.value = res.agents ?? agents.value.map(agent => (
+                agent.id === agentId || agent.agentId === agentId ? res.agent : agent
+            ))
+            if (res.members) members.value = res.members
             return res.agent
         } catch (err: any) {
             error.value = err.message
@@ -900,7 +1010,13 @@ const currentUserAvatar = ref('')
         await new Promise<void>((resolve, reject) => {
             socket.emit('interrupt_agent', { roomId: currentRoomId.value, agentName }, (res: any) => {
                 if (res?.error) reject(new Error(res.error))
-                else resolve()
+                else {
+                    // The server also broadcasts ready. Clear optimistically on
+                    // the successful acknowledgement so the breathing state
+                    // cannot linger if that broadcast races a reconnect.
+                    settleAgentActivity(agentName)
+                    resolve()
+                }
             })
         })
     }
@@ -936,6 +1052,7 @@ const currentUserAvatar = ref('')
         error,
         contextStatus,
         contextStatuses,
+        roomSummaryStates,
         pendingApprovals,
         activePendingApproval,
         autoPlaySpeechEnabled,
@@ -957,6 +1074,7 @@ const currentUserAvatar = ref('')
         connect,
         disconnect,
         setUserInfo,
+        updateCurrentMemberProfile,
         setAutoPlaySpeech,
         setMessageReference,
         clearMessageReference,
@@ -977,6 +1095,7 @@ const currentUserAvatar = ref('')
         setRoomInviteCode,
         loadAgents,
         addAgentToRoom,
+        updateAgentInRoom,
         removeAgentFromRoom,
     }
 })
@@ -1019,6 +1138,18 @@ function groupWorkspaceDiffPayload(value: unknown): GroupWorkspaceDiffPayload | 
         : null
 }
 
+function inferredGroupResponseRunId(message: ChatMessage): string {
+    const explicit = String(message.run_id || '').trim()
+    if (explicit) return explicit
+    const match = String(message.id || '').match(/^(.+)_part_\d+(?:_tool(?:call|result)_.+)?$/)
+    return match?.[1] || ''
+}
+
+function groupToolPairKey(message: ChatMessage, toolCallId: string): string {
+    const runId = inferredGroupResponseRunId(message)
+    return `${runId || 'legacy'}\u0000${toolCallId}`
+}
+
 function attachWorkspaceDiffsToParentMessages(messages: ChatMessage[]): ChatMessage[] {
     const mapped: ChatMessage[] = messages.map(message => ({ ...message, workspaceChanges: [] }))
     const assistantById = new Map(
@@ -1031,27 +1162,70 @@ function attachWorkspaceDiffsToParentMessages(messages: ChatMessage[]): ChatMess
         const payload = groupWorkspaceDiffPayload(message.toolResult ?? message.content)
         const parentMessageId = String(payload?.parent_message_id || '').trim()
         const parent = parentMessageId ? assistantById.get(parentMessageId) : undefined
-        if (!payload || !parent) return true
-        parent.workspaceChanges!.push(payload)
+        if (payload && parent) parent.workspaceChanges!.push(payload)
         return false
     })
 }
 
+function segmentGroupReasoningSnapshots(messages: ChatMessage[]): ChatMessage[] {
+    const previousByRun = new Map<string, string>()
+    return messages.map(message => {
+        if (message.role !== 'assistant') return message
+        if (!message.tool_calls?.length && !runtimePayloadText(message.content).trim()) return message
+        const runId = inferredGroupResponseRunId(message)
+        const current = String(message.reasoning || message.reasoning_content || '')
+        if (!runId || !current) return message
+        const key = `${message.senderId}\u0000${runId}`
+        const previous = previousByRun.get(key) || ''
+        previousByRun.set(key, current)
+        if (!previous || !current.startsWith(previous)) return message
+        const segment = current.slice(previous.length).trimStart()
+        return {
+            ...message,
+            reasoning: segment || null,
+            reasoning_content: segment || null,
+        }
+    })
+}
+
 function mapGroupMessages(msgs: ChatMessage[]): ChatMessage[] {
+    msgs = segmentGroupReasoningSnapshots(msgs)
     const toolNameMap = new Map<string, string>()
     const toolArgsMap = new Map<string, unknown>()
     for (const msg of msgs) {
         if (msg.role === 'assistant' && msg.tool_calls?.length) {
             for (const tc of msg.tool_calls) {
                 if (!tc?.id) continue
-                if (tc.function?.name) toolNameMap.set(tc.id, tc.function.name)
-                if (hasRuntimeToolPayload(tc.function?.arguments)) toolArgsMap.set(tc.id, tc.function.arguments)
+                const pairKey = groupToolPairKey(msg, tc.id)
+                if (tc.function?.name) {
+                    toolNameMap.set(pairKey, tc.function.name)
+                    toolNameMap.set(`legacy\u0000${tc.id}`, tc.function.name)
+                }
+                if (hasRuntimeToolPayload(tc.function?.arguments)) {
+                    toolArgsMap.set(pairKey, tc.function.arguments)
+                    toolArgsMap.set(`legacy\u0000${tc.id}`, tc.function.arguments)
+                }
             }
         }
     }
 
     const result: ChatMessage[] = []
-    for (const msg of msgs) {
+    for (const [index, msg] of msgs.entries()) {
+        if (
+            msg.role === 'assistant' &&
+            !msg.isStreaming &&
+            !msg.tool_calls?.length &&
+            !runtimePayloadText((msg as any).content).trim() &&
+            msg.reasoning?.trim()
+        ) {
+            const matchingToolCall = msgs.slice(index + 1).find(candidate =>
+                candidate.role === 'assistant' &&
+                candidate.tool_calls?.length &&
+                String(candidate.id).startsWith(`${String(msg.id)}_toolcall_`),
+            )
+            if (matchingToolCall?.reasoning?.trim() === msg.reasoning.trim()) continue
+        }
+
         if (
             msg.role !== 'tool' &&
             !msg.tool_calls?.length &&
@@ -1067,6 +1241,7 @@ function mapGroupMessages(msgs: ChatMessage[]): ChatMessage[] {
                 result.push({
                     ...msg,
                     id: `${msg.id}_${tc.id}`,
+                    run_id: inferredGroupResponseRunId(msg) || msg.run_id,
                     role: 'tool',
                     content: '',
                     toolName: tc.function?.name || undefined,
@@ -1080,8 +1255,12 @@ function mapGroupMessages(msgs: ChatMessage[]): ChatMessage[] {
 
         if (msg.role === 'tool') {
             const tcId = msg.tool_call_id || ''
-            const toolName = msg.tool_name || toolNameMap.get(tcId) || undefined
-            const toolArgs = toolArgsMap.has(tcId) ? toolArgsMap.get(tcId) : undefined
+            const pairKey = groupToolPairKey(msg, tcId)
+            const legacyPairKey = `legacy\u0000${tcId}`
+            const toolName = msg.tool_name || toolNameMap.get(pairKey) || toolNameMap.get(legacyPairKey) || undefined
+            const toolArgs = toolArgsMap.has(pairKey)
+                ? toolArgsMap.get(pairKey)
+                : toolArgsMap.get(legacyPairKey)
             let preview = ''
             const toolResult = toolName === 'workspace_diff'
                 ? parseWorkspaceDiffPayload((msg as any).content)
@@ -1098,11 +1277,15 @@ function mapGroupMessages(msgs: ChatMessage[]): ChatMessage[] {
                 }
             }
             const placeholderIdx = result.findIndex(
-                m => m.role === 'tool' && m.toolCallId === tcId && !m.toolResult
+                m => m.role === 'tool' &&
+                    m.toolCallId === tcId &&
+                    !m.toolResult &&
+                    (!inferredGroupResponseRunId(msg) || inferredGroupResponseRunId(m) === inferredGroupResponseRunId(msg))
             )
             const merged: ChatMessage = {
                 ...msg,
                 id: placeholderIdx !== -1 ? result[placeholderIdx].id : msg.id,
+                run_id: inferredGroupResponseRunId(msg) || result[placeholderIdx]?.run_id || msg.run_id,
                 senderId: placeholderIdx !== -1 ? result[placeholderIdx].senderId : msg.senderId,
                 senderName: placeholderIdx !== -1 ? result[placeholderIdx].senderName : msg.senderName,
                 timestamp: placeholderIdx !== -1 ? result[placeholderIdx].timestamp : msg.timestamp,
@@ -1113,6 +1296,11 @@ function mapGroupMessages(msgs: ChatMessage[]): ChatMessage[] {
                 toolArgs: toolArgs !== undefined ? toolArgs : (placeholderIdx !== -1 ? result[placeholderIdx].toolArgs : undefined),
                 toolPreview: typeof preview === 'string' ? preview.slice(0, 100) || undefined : undefined,
                 toolResult,
+                reasoning: msg.reasoning?.trim()
+                    ? msg.reasoning
+                    : placeholderIdx !== -1
+                        ? result[placeholderIdx].reasoning
+                        : undefined,
                 toolStatus: 'done',
             }
             if (placeholderIdx !== -1) result[placeholderIdx] = merged
@@ -1123,4 +1311,41 @@ function mapGroupMessages(msgs: ChatMessage[]): ChatMessage[] {
         result.push(msg)
     }
     return attachWorkspaceDiffsToParentMessages(result)
+}
+
+export function groupAgentRunMessages(messages: ChatMessage[]): ChatMessage[] {
+    const result: ChatMessage[] = []
+    const groupedByRun = new Map<string, ChatMessage>()
+    for (const message of messages) {
+        const runId = inferredGroupResponseRunId(message)
+        if (!runId || (message.role !== 'assistant' && message.role !== 'tool')) {
+            result.push(message)
+            continue
+        }
+        const groupKey = `${message.senderId}\u0000${runId}`
+        const existing = groupedByRun.get(groupKey)
+        if (existing) {
+            existing.runItems!.push(message)
+            existing.isStreaming = existing.runItems!.some(item => item.isStreaming || item.toolStatus === 'running')
+            continue
+        }
+        const grouped: ChatMessage = {
+            ...message,
+            id: `group-agent-run:${message.senderId}:${runId}`,
+            run_id: runId,
+            role: 'agent_run',
+            content: '',
+            reasoning: null,
+            reasoning_content: null,
+            tool_calls: null,
+            runItems: [message],
+            isStreaming: Boolean(message.isStreaming || message.toolStatus === 'running'),
+        }
+        groupedByRun.set(groupKey, grouped)
+        result.push(grouped)
+    }
+    for (const grouped of groupedByRun.values()) {
+        grouped.runItems!.sort((left, right) => left.timestamp - right.timestamp)
+    }
+    return result
 }

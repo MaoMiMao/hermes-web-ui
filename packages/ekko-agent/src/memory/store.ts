@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { DatabaseSync, SQLInputValue } from 'node:sqlite'
 import { EkkoDatabaseManager, type EkkoDatabaseMigration } from '../database'
+import { memorySlotForKind } from './schema'
 import type {
   MemoryAuditEvent,
   MemoryMessage,
@@ -282,6 +283,8 @@ export class SqliteMemoryStore implements MemoryStore {
   async queryNodes(query: MemoryQuery): Promise<MemoryNode[]> {
     const clauses: string[] = []
     const params: SQLInputValue[] = []
+    const relevanceParams: SQLInputValue[] = []
+    const relevanceExpressions: string[] = []
     if (!query.profileId) return []
     clauses.push('profile_id = ?')
     params.push(query.profileId)
@@ -296,6 +299,20 @@ export class SqliteMemoryStore implements MemoryStore {
       params.push(query.domain)
     }
     if (query.types?.length) addInClause(clauses, params, 'type', query.types)
+    if (query.kinds?.length) {
+      const kindClauses: string[] = []
+      for (const kind of query.kinds) {
+        const slot = memorySlotForKind(kind)
+        if (slot.itemized) {
+          kindClauses.push("(key = ? OR key LIKE ? ESCAPE '\\')")
+          params.push(slot.key, `${escapeLike(slot.key)}:%`)
+        } else {
+          kindClauses.push('key = ?')
+          params.push(slot.key)
+        }
+      }
+      clauses.push(`(${kindClauses.join(' OR ')})`)
+    }
     if (query.key) {
       clauses.push('key = ?')
       params.push(query.key)
@@ -309,21 +326,47 @@ export class SqliteMemoryStore implements MemoryStore {
       clauses.push('(category_path_text = ? OR category_path_text LIKE ?)')
       params.push(path, `${escapeLike(path)}/%`)
     }
-    if (query.queryText?.trim()) {
-      const pattern = `%${escapeLike(query.queryText.trim())}%`
-      clauses.push("(title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\' OR tags_json LIKE ? ESCAPE '\\' OR entities_json LIKE ? ESCAPE '\\')")
-      params.push(pattern, pattern, pattern, pattern)
+    const queryTerms = memoryQueryTerms(query.queryText)
+    if (queryTerms.length) {
+      const searchableColumns = [
+        ['title', 5],
+        ['entities_json', 4],
+        ['key', 4],
+        ['tags_json', 3],
+        ['value_json', 3],
+        ['category_path_text', 2],
+        ['content', 2],
+      ] as const
+      const termClauses: string[] = []
+      for (const term of queryTerms) {
+        const pattern = `%${escapeLike(term)}%`
+        termClauses.push(`(${searchableColumns.map(([column]) => `${column} LIKE ? ESCAPE '\\'`).join(' OR ')})`)
+        params.push(...searchableColumns.map(() => pattern))
+        for (const [column, weight] of searchableColumns) {
+          relevanceExpressions.push(`CASE WHEN ${column} LIKE ? ESCAPE '\\' THEN ${weight} ELSE 0 END`)
+          relevanceParams.push(pattern)
+        }
+      }
+      clauses.push(`(${termClauses.join(' OR ')})`)
+    }
+    for (const tag of query.tags || []) {
+      clauses.push("tags_json LIKE ? ESCAPE '\\'")
+      params.push(`%${escapeLike(JSON.stringify(String(tag)))}%`)
+    }
+    for (const entity of query.entities || []) {
+      clauses.push("entities_json LIKE ? ESCAPE '\\'")
+      params.push(`%${escapeLike(JSON.stringify(String(entity)))}%`)
     }
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
+    const relevanceOrder = relevanceExpressions.length
+      ? `${relevanceExpressions.join(' + ')} DESC,`
+      : ''
     const rows = this.db.prepare(`
       SELECT * FROM memory_nodes ${where}
-      ORDER BY importance DESC, confidence DESC, updated_at DESC
+      ORDER BY ${relevanceOrder} importance DESC, confidence DESC, updated_at DESC
       LIMIT ?
-    `).all(...params, boundedLimit(query.limit ?? 50, 200)) as Row[]
-    let nodes = rows.map(nodeFromRow)
-    if (query.tags?.length) nodes = nodes.filter(node => query.tags!.every(tag => node.tags.includes(tag)))
-    if (query.entities?.length) nodes = nodes.filter(node => query.entities!.every(entity => node.entities.includes(entity)))
-    return nodes
+    `).all(...params, ...relevanceParams, boundedLimit(query.limit ?? 50, 500)) as Row[]
+    return rows.map(nodeFromRow)
   }
 
   async appendAuditEvent(event: MemoryAuditEvent): Promise<void> {
@@ -605,6 +648,22 @@ function optionalString(value: unknown): string | undefined {
 
 function escapeLike(value: string): string {
   return value.replace(/[\\%_]/g, match => `\\${match}`)
+}
+
+function memoryQueryTerms(value: string | undefined): string[] {
+  const normalized = String(value || '').normalize('NFKC').toLowerCase().trim()
+  if (!normalized) return []
+  const words = normalized.match(/[a-z0-9_]{2,}|[\p{Script=Han}]{1,}/gu) || []
+  const terms = new Set<string>()
+  for (const word of words) {
+    if (/^[\p{Script=Han}]+$/u.test(word) && word.length > 2) {
+      for (let index = 0; index < word.length - 1; index += 1) terms.add(word.slice(index, index + 2))
+    }
+    terms.add(word)
+    if (terms.size >= 24) break
+  }
+  if (!terms.size) terms.add(normalized)
+  return [...terms].slice(0, 24)
 }
 
 export { stableJson }

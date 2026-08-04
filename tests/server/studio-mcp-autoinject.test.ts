@@ -127,6 +127,15 @@ describe('studio MCP autoinject', () => {
       },
       enabled: true,
     })
+    expect(injectedDefault.data.mcp_servers['hermes-studio-browser']).toMatchObject({
+      command: process.execPath,
+      args: [stableLauncher, 'browser'],
+      env: {
+        HERMES_MCP_SERVER_NAME: 'hermes-studio-browser',
+        HERMES_MCP_TOOLSET: 'browser',
+      },
+      enabled: true,
+    })
     expect(injectedDefault.data.mcp_servers['hermes-studio-devices']).toMatchObject({
       command: process.execPath,
       args: [stableLauncher, 'devices'],
@@ -147,7 +156,12 @@ describe('studio MCP autoinject', () => {
     })
     const injectedWork = await updateConfigYamlForProfileMock.mock.calls[1][1]({})
     expect(injectedWork.data.mcp_servers['hermes-studio-api'].env.HERMES_WEB_UI_PROFILE).toBe('work')
-    expect(result.serverNames).toEqual(['hermes-studio-api', 'hermes-studio-devices', 'hermes-studio-use'])
+    expect(result.serverNames).toEqual([
+      'hermes-studio-api',
+      'hermes-studio-browser',
+      'hermes-studio-devices',
+      'hermes-studio-use',
+    ])
     expect(result.command).toBe(process.execPath)
   })
 
@@ -159,6 +173,32 @@ describe('studio MCP autoinject', () => {
 
     expect(result.targets).toEqual([])
     expect(updateConfigYamlForProfileMock).not.toHaveBeenCalled()
+  })
+
+  it('keeps the same browser MCP entry in desktop mode', async () => {
+    process.env.HERMES_DESKTOP = 'true'
+    const { injectBundledMcpServer } = await import('../../packages/server/src/services/hermes/studio-mcp-autoinject')
+    const result = await injectBundledMcpServer()
+    const injected = await updateConfigYamlForProfileMock.mock.calls[0][1]({})
+    expect(injected.data.mcp_servers['hermes-studio-browser']).toMatchObject({
+      args: [stableLauncher, 'browser'],
+      env: { HERMES_MCP_SERVER_NAME: 'hermes-studio-browser', HERMES_MCP_TOOLSET: 'browser' },
+    })
+    expect(result.serverNames).toContain('hermes-studio-browser')
+  })
+
+  it('does not remove the desktop browser entry when a Web UI process resyncs the shared profile', async () => {
+    const { injectBundledMcpServer } = await import('../../packages/server/src/services/hermes/studio-mcp-autoinject')
+    await injectBundledMcpServer()
+
+    const updater = updateConfigYamlForProfileMock.mock.calls[0][1]
+    const desktopManaged = await updater({})
+    const browserBefore = structuredClone(desktopManaged.data.mcp_servers['hermes-studio-browser'])
+    const webUiResync = await updater(desktopManaged.data)
+
+    expect(webUiResync.write).toBe(false)
+    expect(webUiResync.result.status).toBe('unchanged')
+    expect(webUiResync.data.mcp_servers['hermes-studio-browser']).toEqual(browserBefore)
   })
 
   it('skips autoinject for a transient bundled launcher even with a stable app home', async () => {
@@ -288,6 +328,7 @@ describe('studio MCP autoinject', () => {
     })
     expect(updated.data.mcp_servers['hermes-studio']).toBeUndefined()
     expect(updated.data.mcp_servers['hermes-studio-api']).toBeDefined()
+    expect(updated.data.mcp_servers['hermes-studio-browser']).toBeDefined()
     expect(updated.data.mcp_servers['hermes-studio-devices']).toBeDefined()
     expect(updated.data.mcp_servers['hermes-studio-use']).toBeDefined()
   })
@@ -324,6 +365,7 @@ describe('studio MCP autoinject', () => {
     expect(updated.data.mcp_servers['hermes-web-ui-mcp']).toBeUndefined()
     expect(updated.data.mcp_servers['hermes-studio-api'].command).toBe(process.execPath)
     expect(updated.data.mcp_servers['hermes-studio-api'].args).toEqual([stableLauncher, 'api'])
+    expect(updated.data.mcp_servers['hermes-studio-browser'].args).toEqual([stableLauncher, 'browser'])
     expect(updated.data.mcp_servers['hermes-studio-devices'].args).toEqual([stableLauncher, 'devices'])
     expect(updated.data.mcp_servers['hermes-studio-use'].args).toEqual([stableLauncher, 'use'])
   })
@@ -339,6 +381,9 @@ describe('studio MCP autoinject', () => {
     expect(injected.data.mcp_servers['hermes-studio-api'].command).toBe('/runtime/node')
     expect(injected.data.mcp_servers['hermes-studio-api'].args).toEqual([
       stableLauncher, 'api',
+    ])
+    expect(injected.data.mcp_servers['hermes-studio-browser'].args).toEqual([
+      stableLauncher, 'browser',
     ])
     expect(injected.data.mcp_servers['hermes-studio-devices'].args).toEqual([
       stableLauncher, 'devices',

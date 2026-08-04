@@ -5,8 +5,8 @@ import type { ChatMessage } from '../../../lib/context-compressor'
  */
 export type ContentBlock =
   | { type: 'text'; text: string }
-  | { type: 'image'; name: string; path: string; media_type: string }
-  | { type: 'file'; name: string; path: string; media_type?: string }
+  | { type: 'image'; name: string; path: string; media_type: string; context?: string }
+  | { type: 'file'; name: string; path: string; media_type?: string; context?: string }
 
 export interface SessionMessage {
   id: number | string
@@ -37,6 +37,9 @@ export interface QueuedRun {
   provider?: string
   model_groups?: Array<{ provider: string; models: string[] }>
   instructions?: string
+  groupSystemPrompt?: string
+  groupRoomId?: string
+  groupAgentId?: string
   profile: string
   workspace?: string | null
   source?: ChatRunSource
@@ -67,6 +70,9 @@ export interface BackgroundDelegationState {
   status: 'running' | 'delivering' | 'completed' | 'failed' | 'interrupted'
   profile?: string
   updatedAt: number
+  toolCallId?: string
+  messageId?: number | string
+  dispatchPayload?: Record<string, unknown>
 }
 
 export interface SessionState {
@@ -111,6 +117,8 @@ export interface ResponseRunState {
   responseId?: string
   reasoningMessageId?: number | string
   pendingReasoning?: string
+  toolBoundaryReasoning?: string
+  toolReasoning?: Map<string, string>
   insertedKeys: Set<string>
   toolCalls: Map<string, any>
 }

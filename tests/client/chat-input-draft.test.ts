@@ -103,6 +103,46 @@ describe('ChatInput draft persistence', () => {
     deleteSkillBundleApiMock.mockReset()
     deleteSkillBundleApiMock.mockResolvedValue(undefined)
     dialogWarningMock.mockReset()
+    Object.defineProperty(URL, 'createObjectURL', {
+      configurable: true,
+      value: vi.fn(() => 'blob:chat-attachment'),
+    })
+    Object.defineProperty(URL, 'revokeObjectURL', {
+      configurable: true,
+      value: vi.fn(),
+    })
+  })
+
+  it('adds a pasted non-image file to the attachment list', async () => {
+    const wrapper = mountForSession('session-file-paste')
+    const file = new File(['hello'], 'notes.txt', { type: 'text/plain' })
+    const paste = new Event('paste', { bubbles: true, cancelable: true })
+    Object.defineProperty(paste, 'clipboardData', {
+      value: {
+        items: [{ kind: 'file', type: file.type, getAsFile: () => file }],
+        files: [file],
+      },
+    })
+
+    wrapper.get('textarea').element.dispatchEvent(paste)
+    await nextTick()
+
+    expect(paste.defaultPrevented).toBe(true)
+    expect(wrapper.get('.attachment-file').text()).toContain('notes.txt')
+  })
+
+  it('accepts a browser selection directly into the current composer', async () => {
+    const wrapper = mountForSession('session-browser-selection')
+    const image = new File(['png'], 'browser-element.png', { type: 'image/png' })
+    const context = '{"browser_selection":{"annotations":[{"marker":1,"mode":"element","note":"Make this element clearer"}]}}'
+
+    ;(wrapper.vm as unknown as { addBrowserAttachment: (file: File, context: string) => void }).addBrowserAttachment(image, context)
+    await nextTick()
+
+    expect(wrapper.get('.attachment-thumb').attributes('alt')).toBe('browser-element.png')
+    expect((wrapper.get('textarea').element as HTMLTextAreaElement).value).toBe('')
+    expect(wrapper.get('.attachment-context').attributes('open')).toBeUndefined()
+    expect(wrapper.get('.attachment-context pre').text()).toBe(context)
   })
 
   it('restores unsent text for the active session after the chat view is remounted', async () => {

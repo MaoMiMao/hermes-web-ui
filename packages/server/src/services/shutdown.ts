@@ -4,6 +4,7 @@ import { stopPreviewRuntime } from '../controllers/update'
 import { codingAgentRunManager } from './agent-runner/coding-agent-run-manager'
 import { shutdownManagedGateways } from './hermes/gateway-runner'
 import { stopOutboundRelayClient } from './global-agent/outbound-relay-client'
+import { stopAppRelayClient } from './app-relay/client'
 
 const DEFAULT_SHUTDOWN_FORCE_EXIT_MS = 15_000
 const DEFAULT_DESKTOP_SHUTDOWN_FORCE_EXIT_MS = 15_000
@@ -48,9 +49,20 @@ export function createShutdownHandler(server: any, groupChatServer?: any, chatRu
     if (isShuttingDown) return
     isShuttingDown = true
 
+    const stopAgentBridge = Boolean(agentBridgeManager && shouldStopAgentBridgeOnShutdown(signal))
+
     // Force exit only if graceful cleanup hangs. The bridge can take up to 10s
     // to stop worker subprocesses, so this cap must be longer than that.
-    setTimeout(() => process.exit(0), getShutdownForceExitMs())
+    const forceExitTimer = setTimeout(() => {
+      if (stopAgentBridge) {
+        try {
+          agentBridgeManager?.forceStop?.()
+        } catch (err) {
+          logger.warn(err, 'Failed to force-stop agent bridge during shutdown timeout')
+        }
+      }
+      process.exit(0)
+    }, getShutdownForceExitMs())
 
     logger.info('Shutting down (%s)...', signal)
     console.log(`[shutdown] Received signal: ${signal}`)
@@ -82,7 +94,7 @@ export function createShutdownHandler(server: any, groupChatServer?: any, chatRu
         logger.info('ChatRunSocket closed')
       }
 
-      if (agentBridgeManager && shouldStopAgentBridgeOnShutdown(signal)) {
+      if (stopAgentBridge) {
         try {
           await agentBridgeManager.stop()
           logger.info('Agent bridge stopped')
@@ -95,6 +107,8 @@ export function createShutdownHandler(server: any, groupChatServer?: any, chatRu
 
       stopOutboundRelayClient()
       logger.info('Outbound relay clients closed')
+      stopAppRelayClient()
+      logger.info('App relay clients closed')
 
       codingAgentRunManager.shutdown()
       logger.info('Coding agent hidden sessions closed')
@@ -122,6 +136,7 @@ export function createShutdownHandler(server: any, groupChatServer?: any, chatRu
     }
 
     closeDb()
+    clearTimeout(forceExitTimer)
     process.exit(0)
   }
 }

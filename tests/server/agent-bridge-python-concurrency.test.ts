@@ -82,6 +82,7 @@ approval._session_key = contextvars.ContextVar("approval_session_key", default="
 approval._notify = {}
 approval._resolved_gateway = []
 approval._session_approved = {}
+approval._session_yolo = set()
 approval._permanent_approved = set()
 approval._saved_permanent = set()
 approval._check_execute_code_calls = []
@@ -114,6 +115,16 @@ def is_approved(session_key, pattern_key):
 def approve_session(session_key, pattern_key):
     approval._session_approved.setdefault(session_key, set()).add(pattern_key)
 
+def enable_session_yolo(session_key):
+    if session_key:
+        approval._session_yolo.add(session_key)
+
+def disable_session_yolo(session_key):
+    approval._session_yolo.discard(session_key)
+
+def is_session_yolo_enabled(session_key):
+    return bool(session_key) and session_key in approval._session_yolo
+
 def approve_permanent(pattern_key):
     approval._permanent_approved.add(pattern_key)
 
@@ -135,6 +146,9 @@ approval.unregister_gateway_notify = unregister_gateway_notify
 approval.resolve_gateway_approval = resolve_gateway_approval
 approval.is_approved = is_approved
 approval.approve_session = approve_session
+approval.enable_session_yolo = enable_session_yolo
+approval.disable_session_yolo = disable_session_yolo
+approval.is_session_yolo_enabled = is_session_yolo_enabled
 approval.approve_permanent = approve_permanent
 approval.save_permanent_allowlist = save_permanent_allowlist
 approval.load_permanent_allowlist = load_permanent_allowlist
@@ -146,6 +160,7 @@ spec = importlib.util.spec_from_file_location("hermes_bridge", path)
 bridge = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = bridge
 spec.loader.exec_module(bridge)
+bridge._load_reasoning_config = lambda *_args, **_kwargs: {}
 
 class FakeDb:
     def __init__(self):
@@ -212,6 +227,56 @@ def wait_for(condition, timeout=20):
 `
 
 describe('agent bridge Python session concurrency', () => {
+  it('toggles YOLO for a session before its first Agent session exists', () => {
+    runPython(String.raw`
+${harness}
+
+pool, _fake_db = make_pool()
+assert "session-yolo" not in pool._sessions
+
+enabled = pool.dispatch_command("session-yolo", "/yolo", "default")
+assert enabled == {
+    "session_id": "session-yolo",
+    "command": "yolo",
+    "handled": True,
+    "type": "yolo",
+    "action": "yolo",
+    "enabled": True,
+    "message": "⚡ YOLO mode ON for this session — all commands auto-approved. Use with caution.",
+}, enabled
+assert approval.is_session_yolo_enabled("session-yolo") is True
+assert approval.is_session_yolo_enabled("another-session") is False
+assert "session-yolo" not in pool._sessions
+
+class YoloAwareAgent:
+    def __init__(self):
+        self.seen = []
+
+    def run_conversation(self, message, session_id=None, stream_callback=None, **kwargs):
+        active_session = approval.get_current_session_key()
+        self.seen.append((
+            active_session,
+            approval.is_session_yolo_enabled(active_session),
+        ))
+        return {"output": "done"}
+
+agent = YoloAwareAgent()
+_session, record, thread = start_manual_run(
+    pool,
+    "session-yolo",
+    agent,
+    "first real message",
+)
+thread.join(timeout=2)
+assert not thread.is_alive(), record.result
+assert agent.seen == [("session-yolo", True)], agent.seen
+
+disabled = pool.dispatch_command("session-yolo", "yolo", "default")
+assert disabled["enabled"] is False, disabled
+assert approval.is_session_yolo_enabled("session-yolo") is False
+`)
+  })
+
   it('binds Agent-session background delivery capability across runtime context versions', () => {
     runPython(String.raw`
 ${harness}
@@ -559,6 +624,62 @@ assert [event["event"] for event in polled["sessions"][0]["events"]] == [
     "subagent.start", "subagent.complete"
 ]
 assert polled["sessions"][0]["events"][-1]["status"] == "interrupted"
+`)
+  })
+
+  it('keeps idle sessions alive while durable background delegations are active', () => {
+    runPython(String.raw`
+${harness}
+
+async_module = types.ModuleType("tools.async_delegation")
+async_module.list_async_delegations = lambda: [
+    {
+        "delegation_id": "deleg-running",
+        "status": "running",
+        "parent_session_id": "session-running",
+    },
+    {
+        "delegation_id": "deleg-finalizing",
+        "status": "finalizing",
+        "origin_ui_session_id": "session-finalizing",
+    },
+]
+async_module.interrupt_for_session = lambda **kwargs: 0
+sys.modules["tools.async_delegation"] = async_module
+
+server = bridge.BridgeServer("tcp://127.0.0.1:1")
+server.GC_INTERVAL_SECONDS = 0
+old = time.time() - server.IDLE_TIMEOUT_SECONDS - 1
+for session_id in ("session-running", "session-finalizing", "session-idle"):
+    session = bridge.AgentSession(session_id=session_id, agent=object())
+    session.last_used_at = old
+    server.pool._sessions[session_id] = session
+
+server._gc_idle_sessions()
+
+assert set(server.pool._sessions) == {"session-running", "session-finalizing"}
+`)
+  })
+
+  it('falls back to worker task state when checking idle background work', () => {
+    runPython(String.raw`
+${harness}
+
+async_module = types.ModuleType("tools.async_delegation")
+async_module.list_async_delegations = lambda: (_ for _ in ()).throw(RuntimeError("registry unavailable"))
+async_module.interrupt_for_session = lambda **kwargs: 0
+sys.modules["tools.async_delegation"] = async_module
+
+server = bridge.BridgeServer("tcp://127.0.0.1:1")
+server.GC_INTERVAL_SECONDS = 0
+session = bridge.AgentSession(session_id="session-1", agent=object())
+session.last_used_at = time.time() - server.IDLE_TIMEOUT_SECONDS - 1
+session.background_tasks["child-1"] = {"status": "running"}
+server.pool._sessions[session.session_id] = session
+
+server._gc_idle_sessions()
+
+assert "session-1" in server.pool._sessions
 `)
   })
 
@@ -1214,6 +1335,55 @@ assert resp["exists"] is False
 assert resp["loaded"] is True
 assert broker._session_profile == {}
 assert broker._session_worker_key == {}
+`)
+  })
+
+  it('routes a first-message YOLO command to the requested profile worker', () => {
+    runPython(String.raw`
+${harness}
+
+class CommandWorker:
+    running = True
+    pid = 12345
+    endpoint = "ipc:///tmp/yolo-worker.sock"
+    last_used_at = 12.5
+
+    def __init__(self):
+        self.profile = "work"
+        self.key = "work"
+        self.requests = []
+
+    def request(self, req, timeout=None):
+        self.requests.append(req)
+        return {
+            "ok": True,
+            "session_id": req["session_id"],
+            "command": "yolo",
+            "handled": True,
+            "action": "yolo",
+            "enabled": True,
+        }
+
+broker = bridge.BridgeBroker("ipc:///tmp/unused.sock")
+worker = CommandWorker()
+broker._workers["work"] = worker
+
+response = broker.handle({
+    "action": "command",
+    "session_id": "new-session",
+    "profile": "work",
+    "command": "yolo",
+})
+
+assert response["enabled"] is True, response
+assert worker.requests == [{
+    "action": "command",
+    "session_id": "new-session",
+    "profile": "work",
+    "command": "yolo",
+}], worker.requests
+assert broker._session_profile["new-session"] == "work"
+assert broker._session_worker_key["new-session"] == "work"
 `)
   })
 

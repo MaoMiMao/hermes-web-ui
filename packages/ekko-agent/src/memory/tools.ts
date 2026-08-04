@@ -14,7 +14,7 @@ export function createMemoryTools(service: MemoryService): AgentTool[] {
 class MemorySearchTool implements AgentTool {
   readonly definition = {
     name: 'memory_search',
-    description: 'Search current profile memory. Results include the canonical key, id, revision, value, and content required for precise mutations.',
+    description: 'Search current profile memory. Results include the canonical key, id, revision, value, and content required for precise mutations. Do not search again when automatic recall already contains a direct, conflict-free answer. Otherwise, use this tool to verify personal information, memory questions, or before saying that you do not know or remember. Prefer kinds for known categories and queryText for open-ended questions.',
     parameters: {
       type: 'object',
       properties: {
@@ -22,6 +22,11 @@ class MemorySearchTool implements AgentTool {
         domain: { type: 'string' },
         categoryPathPrefix: { type: 'array', items: { type: 'string' } },
         types: { type: 'array', items: { type: 'string' } },
+        kinds: {
+          type: 'array',
+          items: { type: 'string', enum: [...MEMORY_KINDS] },
+          description: 'Query one or more controlled memory kinds exactly. Prefer this field over natural-language keywords for known categories such as name, home location, relationships, preferences, habits, or goals.',
+        },
         key: { type: 'string' },
         valueJson: {},
         tags: { type: 'array', items: { type: 'string' } },
@@ -42,6 +47,7 @@ class MemorySearchTool implements AgentTool {
       domain: optionalString(input.domain),
       categoryPathPrefix: stringArray(input.categoryPathPrefix),
       types: stringArray(input.types) as MemoryNode['type'][] | undefined,
+      kinds: validMemoryKinds(input.kinds),
       key: optionalString(input.key),
       valueJson: input.valueJson,
       tags: stringArray(input.tags),
@@ -51,6 +57,11 @@ class MemorySearchTool implements AgentTool {
     const result = await this.service.search(identity, query)
     return success(result)
   }
+}
+
+function validMemoryKinds(value: unknown): MemoryQuery['kinds'] {
+  const allowed = new Set<string>(MEMORY_KINDS)
+  return stringArray(value)?.filter(kind => allowed.has(kind)) as MemoryQuery['kinds']
 }
 
 class MemoryGetTool implements AgentTool {

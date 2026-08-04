@@ -12,7 +12,8 @@ import LanguageSwitch from "@/components/layout/LanguageSwitch.vue";
 import ThemeSwitch from "@/components/layout/ThemeSwitch.vue";
 import VersionManagementModal from "@/components/layout/VersionManagementModal.vue";
 import { changelog } from "@/data/changelog";
-import { getStoredUsername, isStoredSuperAdmin } from "@/api/client";
+import { getStoredUserId, getStoredUsername, isStoredSuperAdmin } from "@/api/client";
+import { clearThemeBackgroundCache } from '@/api/theme'
 
 const { t } = useI18n();
 const message = useMessage();
@@ -78,7 +79,9 @@ function handleReloadClient() {
   appStore.reloadClient();
 }
 
-function handleLogout() {
+async function handleLogout() {
+  const userId = getStoredUserId()
+  if (userId) await clearThemeBackgroundCache(userId)
   localStorage.clear();
   window.location.reload();
 }
@@ -259,6 +262,15 @@ function handleUpdateClick() {
           </svg>
         </div>
         <div v-show="!isGroupCollapsed('tools')" class="nav-group-items">
+          <RouteLinkItem v-if="isDesktopShell && hasRoute('hermes.browser')" class="nav-item" :to="{ name: 'hermes.browser' }" :active="selectedKey === 'hermes.browser'">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="9" />
+              <path d="M3 9h18" />
+              <path d="M9 3c-2 5-2 13 0 18" />
+              <path d="M15 3c2 5 2 13 0 18" />
+            </svg>
+            <span>{{ t("sidebar.browser") }}</span>
+          </RouteLinkItem>
           <RouteLinkItem v-if="hasRoute('hermes.codingAgents')" class="nav-item" :to="{ name: 'hermes.codingAgents' }" :active="selectedKey === 'hermes.codingAgents'">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
               <polyline points="16 18 22 12 16 6" />
@@ -300,6 +312,15 @@ function handleUpdateClick() {
           </svg>
         </div>
         <div v-show="!isGroupCollapsed('system')" class="nav-group-items">
+          <RouteLinkItem class="nav-item" :to="{ name: 'hermes.theme' }" :active="selectedKey === 'hermes.theme'">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="13.5" cy="6.5" r="2.5" />
+              <circle cx="17.5" cy="10.5" r="2.5" />
+              <circle cx="8.5" cy="7.5" r="2.5" />
+              <path d="M12 3a9 9 0 1 0 9 9c0-1.1-.9-2-2-2h-1.2a2.8 2.8 0 0 1-2.8-2.8V5c0-1.1-.9-2-2-2h-1z" />
+            </svg>
+            <span>{{ t("sidebar.theme") }}</span>
+          </RouteLinkItem>
           <RouteLinkItem v-if="isSuperAdmin" class="nav-item" :to="{ name: 'hermes.profiles' }" :active="selectedKey === 'hermes.profiles'">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
               <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
@@ -550,7 +571,7 @@ function handleUpdateClick() {
   cursor: pointer;
   transition: all $transition-fast;
   width: 100%;
-  text-align: left;
+  text-align: start;
 
   &:hover {
     background-color: rgba(var(--accent-primary-rgb), 0.06);
@@ -565,7 +586,7 @@ function handleUpdateClick() {
   .beta-tag {
     font-size: 10px;
     color: $text-muted;
-    margin-left: 2px;
+    margin-inline-start: 2px;
   }
 }
 
@@ -609,7 +630,7 @@ function handleUpdateClick() {
 }
 
 .logout-username {
-  margin-left: auto;
+  margin-inline-start: auto;
   max-width: 96px;
   color: $text-muted;
   font-size: 12px;
@@ -631,7 +652,7 @@ function handleUpdateClick() {
   align-items: center;
   gap: 8px;
   min-width: 0;
-  padding-left: 12px;
+  padding-inline-start: 12px;
   font-size: 12px;
   color: $text-secondary;
 

@@ -5,12 +5,21 @@ import { NButton, NDropdown, NTooltip, type DropdownOption } from 'naive-ui'
 import { useGroupChatStore } from '@/stores/hermes/group-chat'
 import { useSettingsStore } from '@/stores/hermes/settings'
 import { useToolTraceVisibility } from '@/composables/useToolTraceVisibility'
+import { extractClipboardFiles } from '@/utils/clipboard-files'
 import { buildMentionOptions, type MentionOption } from './mention-options'
 import type { Attachment } from '@/stores/hermes/chat'
 import { clampChatInputHeight, isMobileChatInputViewport } from '@/utils/chat-input-height'
 
 const { t } = useI18n()
-const emit = defineEmits<{ send: [content: string, attachments?: Attachment[]] }>()
+const props = withDefaults(defineProps<{
+    sendBlocked?: boolean
+}>(), {
+    sendBlocked: false,
+})
+const emit = defineEmits<{
+    send: [content: string, attachments?: Attachment[]]
+    'send-blocked': []
+}>()
 const store = useGroupChatStore()
 const settingsStore = useSettingsStore()
 const { toolTraceVisible, toggleToolTraceVisible } = useToolTraceVisibility()
@@ -285,6 +294,34 @@ function selectMention(name: string) {
     })
 }
 
+function insertMention(name: string) {
+    const mentionName = String(name || '').trim()
+    if (!mentionName) return
+
+    const el = textareaRef.value
+    const selectionStart = el?.selectionStart ?? inputText.value.length
+    const selectionEnd = el?.selectionEnd ?? selectionStart
+    const before = inputText.value.slice(0, selectionStart)
+    const after = inputText.value.slice(selectionEnd)
+    const leadingSpace = before && !/\s$/.test(before) ? ' ' : ''
+    const trailingSpace = after && /^\s/.test(after) ? '' : ' '
+    const inserted = `${leadingSpace}@${mentionName}${trailingSpace}`
+    inputText.value = `${before}${inserted}${after}`
+    mentionActive.value = false
+    mentionStartIndex.value = -1
+    mentionQuery.value = ''
+    store.emitTyping()
+
+    nextTick(() => {
+        if (!el) return
+        const existingWhitespaceOffset = !trailingSpace && /^[ \t]/.test(after) ? 1 : 0
+        const nextPosition = before.length + inserted.length + existingWhitespaceOffset
+        el.setSelectionRange(nextPosition, nextPosition)
+        el.focus()
+        autoSizeTextarea(el)
+    })
+}
+
 // ─── Event Handlers ──────────────────────────────────────
 
 function handleKeydown(e: KeyboardEvent) {
@@ -323,6 +360,10 @@ function handleKeydown(e: KeyboardEvent) {
 function handleSend() {
     const content = inputText.value.trim()
     if (!content && attachments.value.length === 0) return
+    if (props.sendBlocked) {
+        emit('send-blocked')
+        return
+    }
 
     emit('send', content, attachments.value.length > 0 ? attachments.value : undefined)
     inputText.value = ''
@@ -411,16 +452,10 @@ function handleFileChange(e: Event) {
 }
 
 function handlePaste(e: ClipboardEvent) {
-    const items = Array.from(e.clipboardData?.items || [])
-    const imageItems = items.filter(i => i.type.startsWith('image/'))
-    if (!imageItems.length) return
+    const files = extractClipboardFiles(e.clipboardData)
+    if (!files.length) return
     e.preventDefault()
-    for (const item of imageItems) {
-        const blob = item.getAsFile()
-        if (!blob) continue
-        const ext = item.type.split('/')[1] || 'png'
-        addFiles([new File([blob], `pasted-${Date.now()}.${ext}`, { type: item.type })])
-    }
+    addFiles(files)
 }
 
 function handleDragOver(e: DragEvent) {
@@ -450,7 +485,7 @@ function handleDrop(e: DragEvent) {
     addFiles(Array.from(e.dataTransfer?.files || []))
 }
 
-defineExpose({ addFiles })
+defineExpose({ addFiles, insertMention })
 
 function removeAttachment(id: string) {
     const idx = attachments.value.findIndex(a => a.id === id)
@@ -628,8 +663,8 @@ function isImage(type: string): boolean {
     display: flex;
     align-items: center;
     gap: 5px;
-    padding-left: 2px;
-    margin-left: 0;
+    padding-inline-start: 2px;
+    margin-inline-start: 0;
 
     .switch-label {
         display: flex;
@@ -649,7 +684,7 @@ function isImage(type: string): boolean {
     width: 24px;
     min-width: 24px;
     height: 22px;
-    margin-left: 0;
+    margin-inline-start: 0;
     padding: 0;
     background: transparent !important;
 
@@ -839,7 +874,7 @@ function isImage(type: string): boolean {
     width: 100%;
     min-height: 150px;
     background-color: $bg-card;
-    border: 1px solid $border-color;
+    border: 1px solid var(--input-border-color);
     border-radius: 18px;
     padding: 14px 12px 9px;
     position: relative;
@@ -847,8 +882,12 @@ function isImage(type: string): boolean {
     transition: border-color $transition-fast, box-shadow $transition-fast;
 
     &:focus-within {
-        border-color: rgba(var(--text-primary-rgb), 0.22);
+        border-color: var(--input-border-focus-color);
         box-shadow: 0 10px 32px rgba(0, 0, 0, 0.11);
+    }
+
+    &:hover:not(:focus-within) {
+        border-color: var(--input-border-hover-color);
     }
 
     &.drag-over {
@@ -899,7 +938,8 @@ function isImage(type: string): boolean {
     }
 
     &::placeholder {
-        color: $text-muted;
+        color: var(--input-placeholder-color);
+        opacity: 1;
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;

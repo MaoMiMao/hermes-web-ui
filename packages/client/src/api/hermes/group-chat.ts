@@ -9,21 +9,74 @@ export interface RoomInfo {
     name: string
     inviteCode: string | null
     canManage?: boolean
-    triggerTokens?: number
-    maxHistoryTokens?: number
-    tailMessageCount?: number
+    summaryProfile: string
+    summaryProvider: string
+    summaryModel: string
+    summaryApiMode: string
+    summaryEveryTurns: number
     totalTokens?: number
     workspace: string
+}
+
+export interface RoomSummaryConfig {
+    summaryProfile: string
+    summaryProvider: string
+    summaryModel: string
+    summaryApiMode: string
+    summaryEveryTurns: number
+}
+
+export interface RoomConfigInput extends Partial<RoomSummaryConfig> {
+    name?: string
+}
+
+export interface RoomSummaryState {
+    roomId: string
+    summary: string
+    summaryThroughMessageId: string
+    summaryThroughMessageTimestamp: number
+    summarizedTurnCount: number
+    status: 'idle' | 'summarizing' | 'success' | 'failed'
+    version: number
+    updatedAt: number
+    lastError: string | null
+}
+
+export interface RoomSummaryAnchor {
+    id: string
+    timestamp: number
+    senderName: string
+    role?: string
+    content: string
 }
 
 export interface RoomAgent {
     id: string
     roomId: string
     agentId: string
+    agent: 'hermes' | 'ekko' | 'codex' | 'claude'
     profile: string
+    provider: string
+    model: string
+    apiMode: string
+    reasoningEffort: string
     name: string
     description: string
+    avatar: string
     invited: number
+}
+
+export interface RoomAgentInput {
+    agent: 'hermes' | 'ekko' | 'codex' | 'claude'
+    profile: string
+    provider?: string
+    model?: string
+    apiMode?: string
+    reasoningEffort?: string
+    name?: string
+    description?: string
+    avatar?: string
+    invited?: boolean
 }
 
 export interface AgentAddResult {
@@ -42,6 +95,7 @@ export interface ChatMessage {
     senderName: string
     content: string
     timestamp: number
+    run_id?: string | null
     role?: string
     tool_call_id?: string | null
     tool_calls?: any[] | null
@@ -60,6 +114,7 @@ export interface ChatMessage {
     workspaceChanges?: GroupWorkspaceDiffPayload[]
     firstSeenAt?: number
     attachments?: Array<{ id: string; name: string; type: string; size: number; url: string }>
+    runItems?: ChatMessage[]
 }
 
 export interface GroupWorkspaceDiffFile {
@@ -179,8 +234,16 @@ export function disconnectGroupChat(): void {
 export async function createRoom(data: {
     name: string
     inviteCode: string
-    agents?: { profile: string; name?: string; description?: string; invited?: boolean }[]
-    compression?: { triggerTokens?: number; maxHistoryTokens?: number; tailMessageCount?: number }
+    memberName?: string
+    memberDescription?: string
+    agents?: RoomAgentInput[]
+    summary: {
+        profile: string
+        provider: string
+        model: string
+        apiMode: string
+        everyTurns: number
+    }
     workspace?: string
 }): Promise<{ room: RoomInfo; agents: RoomAgent[]; agentResults?: AgentAddResult[] }> {
     return request('/api/hermes/group-chat/rooms', {
@@ -225,14 +288,17 @@ export async function updateInviteCode(roomId: string, inviteCode: string): Prom
     })
 }
 
-export async function addAgent(roomId: string, data: {
-    profile: string
-    name?: string
-    description?: string
-    invited?: boolean
-}): Promise<{ agent: RoomAgent }> {
+export async function addAgent(roomId: string, data: RoomAgentInput): Promise<{ agent: RoomAgent }> {
     return request(`/api/hermes/group-chat/rooms/${roomId}/agents`, {
         method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+    })
+}
+
+export async function updateAgent(roomId: string, agentId: string, data: RoomAgentInput): Promise<{ agent: RoomAgent; agents: RoomAgent[]; members: MemberInfo[] }> {
+    return request(`/api/hermes/group-chat/rooms/${roomId}/agents/${agentId}`, {
+        method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(data),
     })
@@ -260,7 +326,7 @@ export async function clearRoomContext(roomId: string): Promise<{ success: boole
     })
 }
 
-export async function updateRoomConfig(roomId: string, config: { triggerTokens?: number; maxHistoryTokens?: number; tailMessageCount?: number }): Promise<{ room: RoomInfo }> {
+export async function updateRoomConfig(roomId: string, config: RoomConfigInput): Promise<{ room: RoomInfo }> {
     return request(`/api/hermes/group-chat/rooms/${roomId}/config`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -276,9 +342,15 @@ export async function updateRoomWorkspace(roomId: string, workspace: string): Pr
     })
 }
 
-export async function forceCompress(roomId: string): Promise<{ success: boolean; summary: string }> {
-    return request(`/api/hermes/group-chat/rooms/${roomId}/compress`, {
-        method: 'POST',
+export async function getRoomSummary(roomId: string): Promise<{ summary: RoomSummaryState; anchor: RoomSummaryAnchor | null }> {
+    return request(`/api/hermes/group-chat/rooms/${roomId}/summary`)
+}
+
+export async function updateRoomSummary(roomId: string, summary: string): Promise<{ summary: RoomSummaryState }> {
+    return request(`/api/hermes/group-chat/rooms/${roomId}/summary`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ summary }),
     })
 }
 
@@ -300,6 +372,14 @@ export async function readGroupWorkspaceFile(roomId: string, path: string): Prom
 
 export async function fetchGroupWorkspaceFileBlob(roomId: string, path: string, signal?: AbortSignal): Promise<Blob> {
     const params = new URLSearchParams({ path })
+    return fetchAuthenticatedBlob(
+        `/api/hermes/group-chat/rooms/${encodeURIComponent(roomId)}/workspace-file/content?${params}`,
+        { signal },
+    )
+}
+
+export async function fetchGroupWorkspaceAttachmentBlob(roomId: string, path: string, signal?: AbortSignal): Promise<Blob> {
+    const params = new URLSearchParams({ path, download: '1' })
     return fetchAuthenticatedBlob(
         `/api/hermes/group-chat/rooms/${encodeURIComponent(roomId)}/workspace-file/content?${params}`,
         { signal },

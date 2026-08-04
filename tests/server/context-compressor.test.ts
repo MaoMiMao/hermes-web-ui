@@ -7,6 +7,7 @@ const bridgeRequestMock = vi.fn()
 const bridgeDestroyMock = vi.fn()
 const ekkoRuntimeOptionsMock = vi.fn()
 const ekkoRuntimeRunMock = vi.fn()
+const getGlobalEkkoAgentMock = vi.fn()
 const createModelClientMock = vi.fn()
 const resolveModelProviderConfigsMock = vi.fn()
 const resolveEkkoProviderRuntimeConfigMock = vi.fn()
@@ -37,14 +38,11 @@ vi.mock('../../packages/server/src/services/ekko-agent/provider-runtime', () => 
   resolveEkkoProviderRuntimeConfig: resolveEkkoProviderRuntimeConfigMock,
 }))
 
-vi.mock('../../packages/ekko-agent/src', () => ({
-  AgentRuntime: class {
-    constructor(options: unknown) {
-      ekkoRuntimeOptionsMock(options)
-    }
+vi.mock('../../packages/server/src/services/ekko-agent/manager', () => ({
+  getGlobalEkkoAgent: getGlobalEkkoAgentMock,
+}))
 
-    run = ekkoRuntimeRunMock
-  },
+vi.mock('../../packages/ekko-agent/src', () => ({
   createModelClient: createModelClientMock,
   resolveModelProviderConfigs: resolveModelProviderConfigsMock,
 }))
@@ -61,12 +59,19 @@ describe('ChatContextCompressor', () => {
     bridgeDestroyMock.mockReset()
     ekkoRuntimeOptionsMock.mockReset()
     ekkoRuntimeRunMock.mockReset()
+    getGlobalEkkoAgentMock.mockReset()
     createModelClientMock.mockReset()
     resolveModelProviderConfigsMock.mockReset()
     resolveEkkoProviderRuntimeConfigMock.mockReset()
     bridgeRequestMock.mockRejectedValue(new Error('summarizer failed'))
     bridgeDestroyMock.mockResolvedValue(undefined)
     ekkoRuntimeRunMock.mockRejectedValue(new Error('ekko summarizer failed'))
+    getGlobalEkkoAgentMock.mockImplementation(() => ({
+      runIsolated: (options: unknown, input: unknown) => {
+        ekkoRuntimeOptionsMock(options)
+        return ekkoRuntimeRunMock(input)
+      },
+    }))
     resolveEkkoProviderRuntimeConfigMock.mockResolvedValue({
       provider: 'openrouter',
       baseUrl: 'https://openrouter.ai/api/v1',
@@ -108,11 +113,19 @@ describe('ChatContextCompressor', () => {
       [],
       12_000,
       undefined,
-      { profile: 'work', model: 'summary-model', provider: 'openrouter' },
+      {
+        profile: 'work',
+        model: 'summary-model',
+        provider: 'openrouter',
+        sessionId: 'session-1',
+      },
     )
 
     expect(result).toBe('ekko summary')
     expect(ekkoRuntimeOptionsMock).toHaveBeenCalledWith(expect.objectContaining({
+      modelClient: expect.objectContaining({
+        capabilities: expect.objectContaining({ streaming: true }),
+      }),
       toolsEnabled: false,
       skillsEnabled: false,
       maxSteps: 1,
@@ -120,21 +133,30 @@ describe('ChatContextCompressor', () => {
       toolDelayMs: 0,
       modelDefaults: expect.objectContaining({
         model: 'summary-model',
-        toolChoice: 'none',
       }),
     }))
+    expect(ekkoRuntimeOptionsMock.mock.calls[0]?.[0]?.modelDefaults).not.toHaveProperty('toolChoice')
     expect(ekkoRuntimeRunMock).toHaveBeenCalledWith(expect.objectContaining({
       memoryEnabled: false,
       messages: [
         { role: 'user', content: 'Summarize these turns.' },
         { role: 'user', content: 'Generate the context checkpoint summary now.' },
       ],
+      metadata: {
+        purpose: 'context-compression',
+        profile: 'work',
+        session_id: 'session-1',
+      },
+      logContext: {
+        profile: 'work',
+        sessionId: 'session-1',
+      },
     }))
     expect(bridgeRequestMock).not.toHaveBeenCalled()
     expect(bridgeDestroyMock).not.toHaveBeenCalled()
   })
 
-  it('falls back to the existing Hermes summarizer after the first Ekko failure', async () => {
+  it('falls back to the existing Hermes summarizer when the caller allows it', async () => {
     const { callSummarizer } = await import('../../packages/server/src/lib/context-compressor')
     ekkoRuntimeRunMock.mockRejectedValueOnce(new Error('provider unavailable'))
     bridgeRequestMock.mockResolvedValue({
@@ -160,12 +182,30 @@ describe('ChatContextCompressor', () => {
     expect(result).toBe('hermes fallback summary')
     expect(ekkoRuntimeRunMock).toHaveBeenCalledTimes(1)
     expect(bridgeRequestMock).toHaveBeenCalledTimes(1)
-    expect(bridgeRequestMock).toHaveBeenCalledWith(expect.objectContaining({
-      action: 'chat',
-      worker_key: 'default:compression:session-1',
-      model: 'summary-model',
-      provider: 'openrouter',
-    }), expect.any(Object))
+  })
+
+  it('does not fall back to Hermes when the caller disables it', async () => {
+    const { callSummarizer } = await import('../../packages/server/src/lib/context-compressor')
+    ekkoRuntimeRunMock.mockRejectedValueOnce(new Error('provider unavailable'))
+
+    await expect(callSummarizer(
+      '',
+      undefined,
+      'Summarize these turns.',
+      [],
+      12_000,
+      undefined,
+      {
+        profile: 'default',
+        model: 'summary-model',
+        provider: 'openrouter',
+        allowHermesFallback: false,
+      },
+    )).rejects.toThrow('provider unavailable')
+
+    expect(ekkoRuntimeRunMock).toHaveBeenCalledTimes(1)
+    expect(bridgeRequestMock).not.toHaveBeenCalled()
+    expect(bridgeDestroyMock).not.toHaveBeenCalled()
   })
 
   it('keeps full history when full summarization fails', async () => {

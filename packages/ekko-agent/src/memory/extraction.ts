@@ -5,6 +5,7 @@ import type { AgentToolContext } from '../tools/types'
 import type { MemoryService } from './service'
 import { createMemoryTools } from './tools'
 import type { MemoryExtraction, MemoryExtractionInput, MemoryExtractor, MemoryMessage, MemoryNode } from './types'
+import type { EkkoRuntimeLogContext, EkkoRuntimeLogger } from '../logging/runtime-logger'
 
 export interface ModelMemoryExtractorOptions {
   modelClient: ModelClient
@@ -17,6 +18,9 @@ export interface ModelMemoryExtractorOptions {
   maxTokens?: number
   maxTranscriptChars?: number
   fallback?: MemoryExtractor
+  requestLogger?: EkkoRuntimeLogger
+  requestLogContext?: EkkoRuntimeLogContext
+  requestRunId?: string
   onUsage?: (input: {
     purpose: 'ekko-memory-summary'
     usage: ModelUsage
@@ -73,7 +77,7 @@ export class ModelMemoryExtractor implements MemoryExtractor {
         toolChoice: 'auto',
         stream: false,
         metadata: { purpose: 'ekko-memory-summary' },
-      })
+      }, `memory-step-${step + 1}`)
       modelCallIndex += 1
       if (response.usage && this.options.onUsage) {
         try {
@@ -99,10 +103,9 @@ export class ModelMemoryExtractor implements MemoryExtractor {
             signal: this.options.signal,
             temperature: 0.1,
             maxTokens: this.options.maxTokens ?? 1_200,
-            toolChoice: 'none',
             stream: false,
             metadata: { purpose: 'ekko-memory-summary' },
-          })
+          }, `memory-repair-${repairAttempt + 1}`)
           modelCallIndex += 1
           if (repairResponse.usage && this.options.onUsage) {
             try {
@@ -137,20 +140,36 @@ export class ModelMemoryExtractor implements MemoryExtractor {
       }
       for (const toolCall of toolCalls) {
         const result = await tools.execute(toolCall.name, toolCall.arguments, toolContext)
-        messages.push(createToolResultMessage(toolCall.id, result.content, toolCall.name))
+        messages.push(createToolResultMessage(toolCall.id, result.content, toolCall.name, result.contentParts))
       }
     }
     throw new Error('Memory summarizer exceeded its tool step limit.')
   }
 
-  private async createWithRetries(request: ModelRequest): Promise<ModelResponse> {
+  private async createWithRetries(request: ModelRequest, operationId: string): Promise<ModelResponse> {
     const maxRetries = Math.max(0, this.options.maxModelRetries ?? 3)
     let lastError: unknown
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+      if (request.signal?.aborted) {
+        throw request.signal.reason ?? new Error('Memory summarization aborted.')
+      }
+      const span = this.options.requestLogger?.startModelRequest({
+        client: this.options.modelClient,
+        request,
+        runId: this.options.requestRunId || 'memory',
+        attempt: attempt + 1,
+        maxAttempts: maxRetries + 1,
+        transport: 'create',
+        purpose: 'ekko-memory-summary',
+        operationId,
+        context: this.options.requestLogContext,
+      })
       try {
-        if (request.signal?.aborted) throw request.signal.reason ?? new Error('Memory summarization aborted.')
-        return await this.options.modelClient.create(request)
+        const response = await this.options.modelClient.create(request)
+        span?.complete(response)
+        return response
       } catch (error) {
+        span?.fail(error)
         if (request.signal?.aborted) throw error
         lastError = error
       }
@@ -177,6 +196,14 @@ Save compact, standalone information that is likely to prevent the user from rep
 5. Stable environment facts, tools, project conventions, and operating practices that will matter again.
 6. Ongoing projects, commitments, and decisions only when the user states an actual continuing commitment that is expected to outlive the current task. A request, idea, wish, or hypothetical plan is not an ongoing project.
 7. Corrections, refinements, revocations, and explicit requests to remember or forget any of the above.
+
+A durable fact stated directly in ordinary language is valid evidence. Do not require the user to say "remember," and do not recognize only a small set of fixed phrases. Judge whether to save information by its meaning, stability, and future value rather than by specific place names, interests, phrasing, or keywords.
+
+CATEGORY SELECTION
+- Single-slot information: use interaction_contract for interaction agreements, profile_name for the user's name, home_location for home location, occupation for occupation, timezone_preference for timezone, and language_preference for language.
+- Itemized information that may contain multiple independent entries: use accessibility_need for accessibility needs, communication_preference for communication preferences, general_preference for general likes or dislikes, workflow_preference for ways of working, tool_preference for tool choices, personal_relationship for important people and relationships, habit_routine for habits and routines, environment_fact for stable environment information, project_context for long-term project context, long_term_goal for long-term goals, durable_decision for durable decisions, hard_constraint for non-negotiable constraints, and food_avoidance for dietary exclusions.
+- Choose the most specific kind that matches the meaning. Use custom_fact only when the information genuinely does not fit any controlled category; never use it as the default.
+- For an itemized kind, itemKey must be a short, stable concept or entity identifier that distinguishes independent memories that can coexist. Never use a full sentence, timestamp, or random value.
 
 GENERAL DECISION TEST
 - Persist information only when it is likely to remain true and useful across future sessions.

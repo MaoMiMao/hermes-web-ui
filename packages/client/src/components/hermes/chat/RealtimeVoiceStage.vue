@@ -4,7 +4,7 @@ import { useI18n } from 'vue-i18n'
 import { createMcuSpeechSegmenter } from '@/api/hermes/mcu-interaction'
 import { transcribeSpeech } from '@/api/hermes/stt'
 import { fetchSttSettings, type SttProviderSettingsResponse } from '@/api/hermes/stt-settings'
-import { synthesizeSpeech } from '@/api/hermes/tts'
+import { isServerTtsProvider, synthesizeSpeech } from '@/api/hermes/tts'
 import { useBrowserSpeechRecognition } from '@/composables/useBrowserSpeechRecognition'
 import { useMicRecorder } from '@/composables/useMicRecorder'
 import { usePcmStreamRecorder } from '@/composables/usePcmStreamRecorder'
@@ -319,6 +319,13 @@ function currentSynthesisRequest(text: string, signal: AbortSignal) {
         voice: voiceSettings.doubaoVoice.value,
         stylePrompt: voiceSettings.doubaoStylePrompt.value || undefined,
       },
+    })
+  }
+  if (isServerTtsProvider(voiceSettings.provider.value)) {
+    return synthesizeSpeech({
+      provider: voiceSettings.provider.value,
+      text,
+      signal,
     })
   }
   return null
@@ -1291,7 +1298,7 @@ onBeforeUnmount(() => {
   text-transform: uppercase;
 }
 .voice-stage__provider-row .voice-stage__preview { color: rgba(130, 245, 255, 0.78); border-color: rgba(112, 244, 255, 0.18); }
-.voice-stage__dot { display: inline-block; width: 4px; height: 4px; margin-right: 5px; border-radius: 50%; background: var(--voice-accent); box-shadow: 0 0 7px var(--voice-accent); }
+.voice-stage__dot { display: inline-block; width: 4px; height: 4px; margin-inline-end: 5px; border-radius: 50%; background: var(--voice-accent); box-shadow: 0 0 7px var(--voice-accent); }
 
 .voice-stage__orb-wrap { position: relative; width: min(330px, 68vw); aspect-ratio: 1; margin-top: clamp(24px, 5vh, 58px); display: grid; place-items: center; }
 .voice-stage__orbit { position: absolute; border-radius: 50%; border: 1px solid rgba(123, 235, 255, 0.13); }

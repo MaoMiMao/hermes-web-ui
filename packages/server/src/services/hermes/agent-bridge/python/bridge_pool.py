@@ -313,7 +313,7 @@ class AgentPool:
                     credential_pool=runtime.get("credential_pool"),
                     quiet_mode=True,
                     verbose_logging=False,
-                    reasoning_config=_load_reasoning_config(),
+                    reasoning_config=_load_reasoning_config(resolved_model),
                     service_tier=_load_service_tier(),
                     enabled_toolsets=_load_enabled_toolsets(),
                     platform=_bridge_platform(),
@@ -458,6 +458,10 @@ class AgentPool:
         if not callable(switch_model):
             raise RuntimeError("loaded agent does not support switch_model")
 
+        with _profile_env(target_profile):
+            _refresh_worker_profile_env()
+            reasoning_config = _load_reasoning_config(requested_model)
+
         switch_model(
             new_model=requested_model,
             new_provider=resolved_provider,
@@ -465,6 +469,7 @@ class AgentPool:
             base_url=runtime.get("base_url") or "",
             api_mode=runtime.get("api_mode") or "",
         )
+        session.agent.reasoning_config = reasoning_config
         if resolved_provider.lower() == "moa":
             self._install_moa_reference_callback(session)
         session.config.update({
@@ -1731,6 +1736,33 @@ class AgentPool:
         except Exception:
             return []
 
+    def has_active_background_for_session(self, session_id: str) -> bool:
+        """Return whether a session still owns running background work."""
+        try:
+            from tools.async_delegation import list_async_delegations
+
+            for record in list_async_delegations():
+                if str(record.get("status") or "").lower() not in {"running", "finalizing"}:
+                    continue
+                if any(
+                    str(record.get(key) or "") == session_id
+                    for key in ("session_key", "origin_ui_session_id", "parent_session_id")
+                ):
+                    return True
+            return False
+        except Exception:
+            # The durable registry is authoritative when available. Fall back
+            # to worker telemetry so a transient registry failure cannot let
+            # idle GC interrupt a task the worker still sees as active.
+            with self._lock:
+                session = self._sessions.get(session_id)
+                if session is None:
+                    return False
+                return any(
+                    str(task.get("status") or "").lower() in {"running", "finalizing"}
+                    for task in session.background_tasks.values()
+                )
+
     @staticmethod
     def _interrupt_background_for_session(session_id: str, reason: str) -> int:
         try:
@@ -1893,6 +1925,45 @@ class AgentPool:
                 return self._dispatch_goal_command(session_id, arg)
             if name == "subgoal":
                 return self._dispatch_subgoal_command(session_id, arg)
+            if name == "yolo":
+                try:
+                    from tools.approval import (
+                        disable_session_yolo,
+                        enable_session_yolo,
+                        is_session_yolo_enabled,
+                    )
+                except ImportError:
+                    return {
+                        "session_id": session_id,
+                        "command": name,
+                        "handled": False,
+                        "type": "yolo",
+                        "message": (
+                            "/yolo requires a newer Hermes Agent runtime with "
+                            "session-scoped YOLO support."
+                        ),
+                    }
+
+                enabled = not is_session_yolo_enabled(session_id)
+                if enabled:
+                    enable_session_yolo(session_id)
+                else:
+                    disable_session_yolo(session_id)
+                return {
+                    "session_id": session_id,
+                    "command": name,
+                    "handled": True,
+                    "type": "yolo",
+                    "action": "yolo",
+                    "enabled": enabled,
+                    "message": (
+                        "⚡ YOLO mode ON for this session — all commands "
+                        "auto-approved. Use with caution."
+                        if enabled
+                        else "⚠️ YOLO mode OFF for this session — dangerous "
+                        "commands will require approval."
+                    ),
+                }
             if name == "learn":
                 try:
                     from agent.learn_prompt import build_learn_prompt

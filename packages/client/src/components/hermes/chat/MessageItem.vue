@@ -31,6 +31,7 @@ import { speedToEdgeRate, hzToEdgePitch } from "@/utils/ttsHelpers";
 import { formatChatTimestamp } from "@/utils/chat-timestamp";
 import { openSubagentStream, subagentIdFromToolCall } from "@/utils/hermes/subagent-stream";
 import type { WorkspaceRunChangeSummary } from "@/api/hermes/sessions";
+import { isServerTtsProvider } from "@/api/hermes/tts";
 
 const MarkdownRenderer = defineAsyncComponent(async () => (await import("./MarkdownRenderer.vue")).default);
 
@@ -74,6 +75,7 @@ type DisplayContentFile = {
   name: string
   path?: string
   url?: string
+  context?: string
 }
 
 function getBlockText(block: any): string {
@@ -171,6 +173,7 @@ const contentFiles = computed<DisplayContentFile[] | null>(() => {
         type: 'image' as const,
         name: String((block as any).name || `image-${index + 1}`),
         path: String((block as any).path || ''),
+        context: typeof (block as any).context === 'string' ? (block as any).context : undefined,
       }].filter(file => file.path)
     }
     if (block.type === 'file') {
@@ -178,6 +181,7 @@ const contentFiles = computed<DisplayContentFile[] | null>(() => {
         type: 'file' as const,
         name: String((block as any).name || `file-${index + 1}`),
         path: String((block as any).path || ''),
+        context: typeof (block as any).context === 'string' ? (block as any).context : undefined,
       }].filter(file => file.path)
     }
     const imageUrl = getImageUrlFromBlock(block)
@@ -590,9 +594,7 @@ const hasAttachments = computed(
 
 const toolArgsPayload = computed(() => formatToolPayload(props.message.toolArgs));
 const toolResultPayload = computed(() => formatToolPayload(props.message.toolResult, true));
-const toolChange = computed(() => props.message.toolChange || null);
 const workspaceChanges = computed(() => props.message.workspaceChanges || []);
-const hasToolChange = computed(() => (toolChange.value?.files?.length || 0) > 0);
 
 function isWorkspaceChangeExpanded(changeId: string): boolean {
   return expandedWorkspaceChangeIds.value.has(changeId);
@@ -606,7 +608,11 @@ function toggleWorkspaceChange(changeId: string): void {
 }
 
 const hasToolDetails = computed(
-  () => !!(toolArgsPayload.value.full || toolResultPayload.value.full || hasToolChange.value),
+  () => !!(
+    props.message.reasoning?.trim()
+    || toolArgsPayload.value.full
+    || toolResultPayload.value.full
+  ),
 );
 const isSubagentTool = computed(() => subagentIdFromToolCall(props.message.toolCallId) !== null);
 const hasInlineToolDetails = computed(() => hasToolDetails.value && !isSubagentTool.value);
@@ -640,14 +646,6 @@ function handleToolLineClick() {
   if (hasInlineToolDetails.value) toolExpanded.value = !toolExpanded.value;
 }
 
-async function openToolChangeFile(file: { id: string | number; path: string; additions: number; deletions: number }): Promise<void> {
-  const storedFile = toolChange.value?.files.find(candidate => String(candidate.id) === String(file.id));
-  if (!storedFile) return;
-  selectedToolChangeFileId.value = storedFile.id;
-  filesStore.closePreview();
-  await toolPanelStore.openWorkspaceDiff(storedFile, toolChange.value?.workspace || "");
-}
-
 async function openAssistantWorkspaceChangeFile(
   file: { id: string | number; path: string; additions: number; deletions: number },
   change: WorkspaceRunChangeSummary,
@@ -665,13 +663,13 @@ const canPlaySpeech = computed(() => {
   if (props.message.role !== 'assistant') return false
   if (!copyableContent.value) return false
   // OpenAI / Custom / Edge / MiMo / Doubao 不依赖浏览器 Web Speech API
-  if (voiceSettings.provider.value === 'openai' || voiceSettings.provider.value === 'custom' || voiceSettings.provider.value === 'edge' || voiceSettings.provider.value === 'mimo' || voiceSettings.provider.value === 'doubao') return true
+  if (isServerTtsProvider(voiceSettings.provider.value)) return true
   return speech.isSupported
 })
 
 const isPlayingThisMessage = computed(() => {
   // OpenAI / Custom / Edge / MiMo / Doubao 模式
-  if (voiceSettings.provider.value === 'openai' || voiceSettings.provider.value === 'custom' || voiceSettings.provider.value === 'edge' || voiceSettings.provider.value === 'mimo' || voiceSettings.provider.value === 'doubao') {
+  if (isServerTtsProvider(voiceSettings.provider.value)) {
     return speech.currentCustomMessageId.value === props.message.id && speech.isCustomPlaying.value
   }
   return speech.currentMessageId.value === props.message.id && speech.isPlaying.value
@@ -679,7 +677,7 @@ const isPlayingThisMessage = computed(() => {
 
 const isPausedThisMessage = computed(() => {
   // OpenAI / Custom / Edge / MiMo / Doubao 模式
-  if (voiceSettings.provider.value === 'openai' || voiceSettings.provider.value === 'custom' || voiceSettings.provider.value === 'edge' || voiceSettings.provider.value === 'mimo' || voiceSettings.provider.value === 'doubao') {
+  if (isServerTtsProvider(voiceSettings.provider.value)) {
     return speech.currentCustomMessageId.value === props.message.id && speech.isCustomPaused.value
   }
   return speech.currentMessageId.value === props.message.id && speech.isPaused.value
@@ -766,6 +764,13 @@ function handleSpeechToggle() {
     return
   }
 
+  if (isServerTtsProvider(voiceSettings.provider.value)) {
+    speech.openaiToggle(props.message.id, content, {
+      provider: voiceSettings.provider.value,
+    })
+    return
+  }
+
   // Web Speech API 模式
   if (voiceSettings.provider.value === 'webspeech') {
     speech.toggleBrowser(props.message.id, content, {
@@ -837,6 +842,10 @@ onMounted(() => {
           voice: voiceSettings.doubaoVoice.value,
           stylePrompt: voiceSettings.doubaoStylePrompt.value || undefined,
         }).catch(handleAutoplayTtsError)
+      } else if (isServerTtsProvider(voiceSettings.provider.value)) {
+        void speech.openaiPlay(props.message.id, content, {
+          provider: voiceSettings.provider.value,
+        }).catch(handleAutoplayTtsError)
       } else if (voiceSettings.provider.value === 'webspeech') {
         const text = speech.extractReadableText(content)
         if (text) {
@@ -867,12 +876,11 @@ onBeforeUnmount(() => {
 <template>
   <div
     class="message"
-    :class="[message.role, { highlight, 'tool-change-message': hasToolChange }]"
+    :class="[message.role, { highlight }]"
     :id="`message-${message.id}`"
   >
     <template v-if="message.role === 'tool'">
       <div
-        v-if="!hasToolChange"
         class="tool-line"
         :class="{ expandable: hasInlineToolDetails || isSubagentTool, 'subagent-entry': isSubagentTool }"
         :role="isSubagentTool ? 'button' : undefined"
@@ -923,23 +931,13 @@ onBeforeUnmount(() => {
           t("chat.error")
         }}</span>
       </div>
-      <div
-        v-if="hasToolChange"
-        class="tool-detail-section tool-change-standalone"
-        @click="handleToolDetailClick"
-      >
-        <ToolChangeCard
-          :files="toolChange?.files || []"
-          :files-changed="toolChange?.files_changed || 0"
-          :additions="toolChange?.additions || 0"
-          :deletions="toolChange?.deletions || 0"
-          :expanded="toolExpanded"
-          :selected-file-id="selectedToolChangeFileId"
-          @toggle="toolExpanded = !toolExpanded"
-          @select="openToolChangeFile"
-        />
-      </div>
-      <div v-else-if="!isSubagentTool && toolExpanded && hasToolDetails" class="tool-details" @click="handleToolDetailClick">
+      <div v-if="!isSubagentTool && toolExpanded && hasToolDetails" class="tool-details" @click="handleToolDetailClick">
+        <div v-if="message.reasoning?.trim()" class="tool-detail-section">
+          <div class="tool-detail-label">{{ t("chat.thinkingLabel") }}</div>
+          <div class="tool-detail-reasoning">
+            <MarkdownRenderer :content="message.reasoning" />
+          </div>
+        </div>
         <div v-if="formattedToolArgs" class="tool-detail-section" data-copy-source="tool-args">
           <div class="tool-detail-label">{{ t("chat.arguments") }}</div>
           <div class="tool-detail-code-block" v-html="renderedToolArgs"></div>
@@ -975,7 +973,7 @@ onBeforeUnmount(() => {
                 v-for="att in message.attachments"
                 :key="att.id"
                 class="msg-attachment"
-                :class="{ image: isImage(att.type) }"
+                :class="{ image: isImage(att.type), 'has-context': !!att.context }"
               >
                 <template v-if="isImage(att.type) && att.url">
                   <img
@@ -1009,6 +1007,10 @@ onBeforeUnmount(() => {
                     </svg>
                   </div>
                 </template>
+                <details v-if="att.context" class="msg-attachment-context">
+                  <summary>{{ t('browser.selectionData') }}</summary>
+                  <pre>{{ att.context }}</pre>
+                </details>
               </div>
             </div>
             <div
@@ -1063,7 +1065,7 @@ onBeforeUnmount(() => {
                     v-for="(file, idx) in contentFiles"
                     :key="idx"
                     class="msg-attachment"
-                    :class="{ image: file.type === 'image' }"
+                    :class="{ image: file.type === 'image', 'has-context': !!file.context }"
                   >
                     <template v-if="file.type === 'image'">
                       <img
@@ -1087,6 +1089,10 @@ onBeforeUnmount(() => {
                         <span class="att-name">{{ file.name }}</span>
                       </div>
                     </template>
+                    <details v-if="file.context" class="msg-attachment-context">
+                      <summary>{{ t('browser.selectionData') }}</summary>
+                      <pre>{{ file.context }}</pre>
+                    </details>
                   </div>
                 </div>
               </template>
@@ -1272,10 +1278,6 @@ onBeforeUnmount(() => {
 
   &.tool {
     align-items: flex-start;
-
-    &.tool-change-message {
-      max-width: 100%;
-    }
   }
 
   &.system {
@@ -1324,7 +1326,7 @@ onBeforeUnmount(() => {
 
 .message-bubble {
   padding: 10px 14px;
-  font-size: 14px;
+  font-size: var(--font-size-base);
   line-height: 1.65;
   word-break: break-word;
   overflow-wrap: anywhere;
@@ -1335,14 +1337,14 @@ onBeforeUnmount(() => {
   box-sizing: border-box;
 
   &.system {
-    border-left: 3px solid $warning;
+    border-inline-start: 3px solid $warning;
     border-radius: $radius-sm;
     max-width: 80%;
     background-color: rgba(var(--warning-rgb), 0.06);
   }
 
   &.command {
-    border-left: none;
+    border-inline-start: none;
     border: 1px solid rgba(var(--accent-primary-rgb), 0.12);
     background-color: rgba(var(--accent-primary-rgb), 0.04);
     color: $text-secondary;
@@ -1376,6 +1378,14 @@ onBeforeUnmount(() => {
       0 0 20px rgba(255, 107, 107, 0.2);
     animation: rainbow-glow 4s linear infinite;
   }
+}
+
+:global(html.theme-has-custom-background .message.user .message-bubble:not(.system):not(.command):not(.agent-error)),
+:global(html.theme-has-custom-background .message.assistant .message-bubble:not(.system):not(.command):not(.agent-error)) {
+  background-color: rgba(var(--bg-main-surface-rgb), 0.78);
+  border: 1px solid rgba(var(--text-primary-rgb), 0.18);
+  -webkit-backdrop-filter: blur(8px) saturate(110%);
+  backdrop-filter: blur(8px) saturate(110%);
 }
 
 .command-result {
@@ -1507,6 +1517,10 @@ onBeforeUnmount(() => {
   &.image {
     max-width: 200px;
   }
+
+  &.image.has-context {
+    max-width: 420px;
+  }
 }
 
 .msg-attachment-thumb {
@@ -1515,6 +1529,22 @@ onBeforeUnmount(() => {
   max-height: 160px;
   object-fit: contain;
   cursor: pointer;
+}
+
+.msg-attachment.has-context .msg-attachment-thumb {
+  max-width: 420px;
+  max-height: 280px;
+}
+
+.msg-attachment-context {
+  max-width: 420px;
+  padding: 7px 9px;
+  border-top: 1px solid $border-light;
+  color: $text-secondary;
+  font-size: 11px;
+
+  summary { cursor: pointer; user-select: none; }
+  pre { max-height: 200px; margin: 8px 0 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 10px/1.45 monospace; }
 }
 
 .msg-attachment-file {
@@ -1587,7 +1617,7 @@ onBeforeUnmount(() => {
   .thinking-body {
     margin-top: 6px;
     padding: 6px 10px;
-    border-left: 2px solid $border-light;
+    border-inline-start: 2px solid $border-light;
     font-size: 13px;
     opacity: 0.85;
     font-style: italic;
@@ -1602,6 +1632,7 @@ onBeforeUnmount(() => {
   gap: 6px;
   margin-top: 4px;
   padding: 0 4px;
+  color: $text-muted;
   opacity: 0;
   transition: opacity 0.15s ease;
 
@@ -1626,7 +1657,7 @@ onBeforeUnmount(() => {
   height: 24px;
   border: none;
   background: transparent;
-  color: $text-muted;
+  color: inherit;
   cursor: pointer;
   border-radius: $radius-sm;
   padding: 0;
@@ -1637,14 +1668,6 @@ onBeforeUnmount(() => {
     background: rgba(0, 0, 0, 0.06);
   }
 
-  .dark & {
-    color: #999999;
-
-    &:hover {
-      color: #cccccc;
-      background: rgba(255, 255, 255, 0.1);
-    }
-  }
 }
 
 .speech-bubble-btn {
@@ -1670,12 +1693,8 @@ onBeforeUnmount(() => {
 
 .message-time {
   font-size: 11px;
-  color: $text-muted;
+  color: inherit;
   user-select: none;
-
-  .dark & {
-    color: #999999;
-  }
 }
 
 .tool-line {
@@ -1689,6 +1708,16 @@ onBeforeUnmount(() => {
   min-width: 0;
   max-width: 100%;
   box-sizing: border-box;
+
+  &.subagent-entry {
+    display: inline-flex;
+    width: fit-content;
+    max-width: min(560px, calc(100% - 8px));
+
+    .tool-preview {
+      flex-grow: 0;
+    }
+  }
 
   &.expandable {
     cursor: pointer;
@@ -1747,25 +1776,18 @@ onBeforeUnmount(() => {
   padding: 0 4px;
   border-radius: 3px;
   line-height: 14px;
-  margin-left: 4px;
+  margin-inline-start: 4px;
 }
 
 .tool-details {
-  margin-left: 16px;
+  margin-inline-start: 16px;
   margin-top: 2px;
-  border-left: 2px solid $border-light;
-  padding-left: 10px;
+  border-inline-start: 2px solid $border-light;
+  padding-inline-start: 10px;
 }
 
 .tool-detail-section {
   margin-bottom: 6px;
-}
-
-.tool-change-standalone {
-  display: inline-block;
-  max-width: 100%;
-  min-width: 0;
-  width: fit-content;
 }
 
 .tool-detail-label {
@@ -1802,6 +1824,25 @@ onBeforeUnmount(() => {
   }
 }
 
+.tool-detail-reasoning {
+  max-height: 300px;
+  overflow-y: auto;
+  padding: 8px 10px;
+  border: 1px solid $border-light;
+  border-radius: $radius-sm;
+  background: rgba(var(--text-primary-rgb), 0.035);
+  color: $text-secondary;
+  font-size: 12px;
+
+  :deep(.markdown-body > :first-child) {
+    margin-top: 0;
+  }
+
+  :deep(.markdown-body > :last-child) {
+    margin-bottom: 0;
+  }
+}
+
 .tool-change-loading {
   color: $text-muted;
   font-size: 11px;
@@ -1822,7 +1863,7 @@ onBeforeUnmount(() => {
   width: 2px;
   height: 1em;
   background-color: $text-muted;
-  margin-left: 2px;
+  margin-inline-start: 2px;
   vertical-align: text-bottom;
   animation: blink 0.8s infinite;
 }
@@ -1899,19 +1940,14 @@ onBeforeUnmount(() => {
     max-width: 100%;
   }
 
-  .tool-change-standalone {
-    min-width: 0;
-    width: fit-content;
-  }
-
   :global(.tool-change-drawer-header) {
-    padding-left: 12px !important;
-    padding-right: 12px !important;
+    padding-inline-start: 12px !important;
+    padding-inline-end: 12px !important;
   }
 
   :global(.tool-change-drawer-body-content) {
-    padding-left: 8px !important;
-    padding-right: 8px !important;
+    padding-inline-start: 8px !important;
+    padding-inline-end: 8px !important;
   }
 }
 </style>

@@ -84,11 +84,13 @@ function handleDelete() {
 async function handleExport() {
   exporting.value = true
   try {
-    const ok = await profilesStore.exportProfile(props.profile.name)
-    if (ok) {
+    const res = await profilesStore.exportProfile(props.profile.name)
+    if (res.success) {
       message.success(t('profiles.exportSuccess'))
+    } else if (res.code === 'archive_timeout') {
+      message.error(t('profiles.exportTimeout'), { duration: 8000 })
     } else {
-      message.error(t('profiles.exportFailed'))
+      message.error(res.error || t('profiles.exportFailed'))
     }
   } finally {
     exporting.value = false
@@ -113,7 +115,7 @@ function handleEditConfig() {
         <ProfileAvatar :name="profile.name" :avatar="profile.avatar" :size="28" />
         <h3 class="profile-name">{{ profile.name }}</h3>
       </div>
-      <NTag v-if="profile.active" size="tiny" type="success" :bordered="false">
+      <NTag v-if="profile.active" size="tiny" type="primary" :bordered="false">
         {{ t('profiles.active') }}
       </NTag>
     </div>
@@ -209,7 +211,7 @@ function handleEditConfig() {
   }
 
   &.active {
-    border-color: rgba(var(--success-rgb), 0.4);
+    border-color: rgba(var(--accent-primary-rgb), 0.4);
   }
 }
 
@@ -286,13 +288,13 @@ function handleEditConfig() {
   font-size: 12px;
   color: $text-muted;
   flex-shrink: 0;
-  margin-right: 12px;
+  margin-inline-end: 12px;
 }
 
 .info-value {
   font-size: 12px;
   color: $text-secondary;
-  text-align: right;
+  text-align: end;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

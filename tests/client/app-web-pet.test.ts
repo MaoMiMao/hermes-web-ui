@@ -2,10 +2,15 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const routeMock = vi.hoisted(() => ({ name: 'hermes.chat' as string }))
+const routeMock = vi.hoisted(() => ({
+  name: 'hermes.chat' as string,
+  meta: {} as Record<string, unknown>,
+}))
 const appStoreMock = vi.hoisted(() => ({
   nodeVersion: '23.0.0',
   sidebarOpen: true,
+  sidebarCollapsed: false,
+  pageSidebarExpanded: true,
   toggleSidebar: vi.fn(),
   closeSidebar: vi.fn(),
   loadModels: vi.fn(),
@@ -24,11 +29,18 @@ vi.mock('vue-router', async (importOriginal) => {
 vi.mock('vue-i18n', () => ({
   useI18n: () => ({
     t: (key: string, params?: Record<string, unknown>) => params?.version ? `${key}:${params.version}` : key,
+    locale: { value: 'en' },
   }),
 }))
 
 vi.mock('@/composables/useTheme', () => ({
-  useTheme: () => ({ isDark: false, isComic: false }),
+  useTheme: () => ({
+    isDark: false,
+    isComic: false,
+    customization: { value: { fontSize: 14, textColor: null, accentColor: null } },
+    hasBackgroundImage: false,
+    syncThemeFromServer: vi.fn().mockResolvedValue(undefined),
+  }),
 }))
 
 vi.mock('@/composables/useKeyboard', () => ({
@@ -68,13 +80,23 @@ vi.mock('@/components/layout/AppSidebar.vue', () => ({
 }))
 
 vi.mock('@/components/layout/DesktopTitleBar.vue', () => ({
-  default: { name: 'DesktopTitleBar', template: '<div />' },
+  default: {
+    name: 'DesktopTitleBar',
+    props: ['standalone', 'leftOffset'],
+    template: '<div />',
+  },
 }))
 
 import App from '@/App.vue'
 
 type WindowWithDesktop = typeof window & {
-  hermesDesktop?: { isDesktop?: boolean; platform?: string }
+  hermesDesktop?: {
+    isDesktop?: boolean
+    platform?: string
+    windowKind?: 'main' | 'pet' | 'chat'
+    getWindowState?: () => Promise<{ isMaximized: boolean }>
+    onWindowStateChange?: (callback: (state: { isMaximized: boolean }) => void) => () => void
+  }
 }
 
 function mountApp() {
@@ -87,7 +109,6 @@ function mountApp() {
         NNotificationProvider: { template: '<div><slot /></div>' },
         AuthEventListener: true,
         AppSidebar: true,
-        DesktopTitleBar: true,
         SessionSearchModal: true,
         DefaultCredentialPrompt: true,
         RouterView: { template: '<div class="router-view-test" />' },
@@ -100,6 +121,9 @@ describe('App web pet mounting', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     routeMock.name = 'hermes.chat'
+    routeMock.meta = {}
+    appStoreMock.sidebarCollapsed = false
+    appStoreMock.pageSidebarExpanded = true
     delete (window as WindowWithDesktop).hermesDesktop
   })
 
@@ -110,7 +134,7 @@ describe('App web pet mounting', () => {
     expect(wrapper.findComponent({ name: 'WebPet' }).exists()).toBe(true)
   })
 
-  it('does not mount the web pet in the Electron desktop shell', () => {
+  it('uses native macOS traffic lights without mounting custom window controls', () => {
     Object.defineProperty(window, 'hermesDesktop', {
       configurable: true,
       value: { isDesktop: true, platform: 'darwin' },
@@ -119,6 +143,59 @@ describe('App web pet mounting', () => {
     const wrapper = mountApp()
 
     expect(wrapper.findComponent({ name: 'WebPet' }).exists()).toBe(false)
+    expect(wrapper.find('.app-shell').classes()).toContain('desktop-platform-darwin')
+    expect(wrapper.findComponent({ name: 'DesktopTitleBar' }).exists()).toBe(false)
+  })
+
+  it('mounts the standalone Windows control bar above main content', async () => {
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { isDesktop: true, platform: 'win32' },
+    })
+
+    const wrapper = mountApp()
+    await flushPromises()
+
+    expect(wrapper.find('.app-shell').classes()).toContain('desktop-platform-win32')
+    expect(wrapper.findComponent({ name: 'DesktopTitleBar' }).exists()).toBe(true)
+  })
+
+  it('expands the Windows control bar when a page-owned sidebar is collapsed', async () => {
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { isDesktop: true, platform: 'win32' },
+    })
+    appStoreMock.pageSidebarExpanded = false
+
+    const wrapper = mountApp()
+    await flushPromises()
+
+    expect(wrapper.findComponent({ name: 'DesktopTitleBar' }).props('leftOffset')).toBe(10)
+  })
+
+  it('marks Windows desktop shell as maximized when the native window state changes', async () => {
+    let listener: ((state: { isMaximized: boolean }) => void) | undefined
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        isDesktop: true,
+        platform: 'win32',
+        getWindowState: vi.fn().mockResolvedValue({ isMaximized: false }),
+        onWindowStateChange: vi.fn((callback) => {
+          listener = callback
+          return vi.fn()
+        }),
+      },
+    })
+
+    const wrapper = mountApp()
+    await flushPromises()
+    expect(wrapper.find('.app-shell').classes()).not.toContain('desktop-window-maximized')
+
+    listener?.({ isMaximized: true })
+    await flushPromises()
+
+    expect(wrapper.find('.app-shell').classes()).toContain('desktop-window-maximized')
   })
 
   it('does not duplicate the web pet on the dedicated desktop pet route', () => {
@@ -126,6 +203,23 @@ describe('App web pet mounting', () => {
 
     const wrapper = mountApp()
 
+    expect(wrapper.findComponent({ name: 'WebPet' }).exists()).toBe(false)
+  })
+
+  it('leaves chat window controls to native chrome without mounting the application sidebar', async () => {
+    routeMock.name = 'desktop.chat'
+    routeMock.meta = { standaloneChat: true }
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: { isDesktop: true, platform: 'darwin', windowKind: 'chat' },
+    })
+
+    const wrapper = mountApp()
+    await flushPromises()
+
+    expect(wrapper.find('.app-shell').classes()).toContain('desktop-chat-window')
+    expect(wrapper.findComponent({ name: 'DesktopTitleBar' }).exists()).toBe(false)
+    expect(wrapper.findComponent({ name: 'AppSidebar' }).exists()).toBe(false)
     expect(wrapper.findComponent({ name: 'WebPet' }).exists()).toBe(false)
   })
 })

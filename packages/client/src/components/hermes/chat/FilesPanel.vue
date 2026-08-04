@@ -2,7 +2,7 @@
 import { defineAsyncComponent, ref, onMounted, watch } from 'vue'
 import { useFilesStore } from '@/stores/hermes/files'
 import { useI18n } from 'vue-i18n'
-import { NButton } from 'naive-ui'
+import { NButton, useMessage } from 'naive-ui'
 import FileTree from '@/components/hermes/files/FileTree.vue'
 import FileBreadcrumb from '@/components/hermes/files/FileBreadcrumb.vue'
 import FileToolbar from '@/components/hermes/files/FileToolbar.vue'
@@ -11,16 +11,23 @@ import FileContextMenu from '@/components/hermes/files/FileContextMenu.vue'
 import FileUploadModal from '@/components/hermes/files/FileUploadModal.vue'
 import FileRenameModal from '@/components/hermes/files/FileRenameModal.vue'
 import type { FileEntry } from '@/api/hermes/files'
+import { fetchSessionWorkspaceAttachmentBlob } from '@/api/hermes/sessions'
+import { fetchGroupWorkspaceAttachmentBlob } from '@/api/hermes/group-chat'
 
 const FileEditor = defineAsyncComponent(async () => (await import('@/components/hermes/files/FileEditor.vue')).default)
 
 const filesStore = useFilesStore()
 const { t } = useI18n()
+const message = useMessage()
 
 const props = defineProps<{
   workspaceSessionId?: string | null
   workspaceRoomId?: string | null
   workspace?: string | null
+}>()
+
+const emit = defineEmits<{
+  (e: 'attach', file: File): void
 }>()
 
 const contextMenuRef = ref<InstanceType<typeof FileContextMenu> | null>(null)
@@ -62,6 +69,24 @@ function handleRename(entry: FileEntry) {
   renameEntry.value = entry
   renameTargetPath.value = null
   showRenameModal.value = true
+}
+
+async function handleAttach(entry: FileEntry) {
+  if (entry.isDir) return
+  try {
+    const blob = props.workspaceSessionId
+      ? await fetchSessionWorkspaceAttachmentBlob(props.workspaceSessionId, entry.path)
+      : props.workspaceRoomId
+        ? await fetchGroupWorkspaceAttachmentBlob(props.workspaceRoomId, entry.path)
+        : null
+    if (!blob) return
+    emit('attach', new File([blob], entry.name, {
+      type: blob.type || 'application/octet-stream',
+      lastModified: Date.parse(entry.modTime) || Date.now(),
+    }))
+  } catch {
+    message.error(t('files.attachFailed'))
+  }
 }
 
 watch(
@@ -136,6 +161,8 @@ onMounted(() => {
     </div>
     <FileContextMenu
       ref="contextMenuRef"
+      :allow-attach="Boolean(workspaceSessionId || workspaceRoomId)"
+      @attach="handleAttach"
       @rename="handleRename"
       @new-folder="handleContextNewFolder"
     />
@@ -158,6 +185,7 @@ onMounted(() => {
   min-height: 0;
   overflow: hidden;
   position: relative;
+  background: inherit;
 }
 
 .sidebar-overlay {
@@ -178,16 +206,17 @@ onMounted(() => {
   width: 200px;
   min-width: 150px;
   max-width: 300px;
-  border-right: 1px solid $border-color;
+  border-inline-end: 1px solid $border-color;
   overflow-y: auto;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
+  background: inherit;
 
   @media (max-width: $breakpoint-mobile) {
     position: fixed;
     top: 0;
-    left: 0;
+    inset-inline-start: 0;
     bottom: 0;
     width: 80%;
     max-width: 300px;
@@ -196,6 +225,11 @@ onMounted(() => {
     box-shadow: 2px 0 8px rgba(0, 0, 0, 0.15);
     transform: translateX(-100%);
     transition: transform 0.3s ease;
+
+    &:dir(rtl) {
+      box-shadow: -2px 0 8px rgba(0, 0, 0, 0.15);
+      transform: translateX(100%);
+    }
 
     &.mobile-visible {
       transform: translateX(0);
@@ -209,19 +243,25 @@ onMounted(() => {
   flex-direction: column;
   min-width: 0;
   overflow: hidden;
+  background: inherit;
 }
 
 .main-toolbar {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 12px 16px;
+  gap: 6px;
+  padding: 5px 10px;
   border-bottom: 1px solid $border-color;
   flex-shrink: 0;
+  background: inherit;
+
+  :deep(.file-toolbar) {
+    padding: 0;
+  }
 
   @media (max-width: $breakpoint-mobile) {
     gap: 4px;
-    padding: 8px 8px;
+    padding: 4px 8px;
     flex-wrap: wrap;
   }
 }
@@ -266,5 +306,6 @@ onMounted(() => {
   flex: 1;
   overflow-y: auto;
   min-height: 0;
+  background: inherit;
 }
 </style>

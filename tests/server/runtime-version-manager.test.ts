@@ -14,6 +14,7 @@ vi.mock('../../packages/server/src/config', () => ({
 }))
 
 vi.mock('../../packages/server/src/services/system-info', () => ({
+  getHermesAgentVersion: () => 'v2026.8.1',
   getHermesWebUiVersion: () => '0.6.31',
 }))
 
@@ -36,6 +37,7 @@ describe('runtime version manager storage migration', () => {
 
   afterEach(() => {
     process.env = { ...originalEnv }
+    vi.unstubAllGlobals()
     vi.resetModules()
     for (const directory of tempDirs.splice(0)) {
       rmSync(directory, { recursive: true, force: true })
@@ -64,6 +66,27 @@ describe('runtime version manager storage migration', () => {
     expect(persisted.runtimeRootDirectory).toBeUndefined()
   })
 
+  it('reports the installed Hermes Agent version separately from the Runtime package version', async () => {
+    const activeVersionPath = join(state.appHome, 'desktop-runtime', 'active-version.json')
+    mkdirSync(join(state.appHome, 'desktop-runtime'), { recursive: true })
+    writeFileSync(activeVersionPath, JSON.stringify({
+      schema: 1,
+      hermesRuntimeVersion: '0.19.1',
+      runtimeDirectory: join(state.appHome, 'desktop-runtime', 'hermes', '0.19.1', 'test-platform'),
+      platform: 'test-platform',
+    }))
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ schema: 1, hermes: ['0.19.1'], webui: ['0.6.31'] }),
+    }))
+
+    const { getRuntimeVersionStatus } = await import('../../packages/server/src/services/runtime-version-manager')
+    const status = await getRuntimeVersionStatus()
+
+    expect(status.hermes.activeVersion).toBe('0.19.1')
+    expect(status.hermes.agentVersion).toBe('v2026.8.1')
+  })
+
   it('rejects a destination nested inside the current Runtime storage root', async () => {
     const nestedDestination = join(state.appHome, 'desktop-runtime', 'nested')
     mkdirSync(nestedDestination, { recursive: true })
@@ -86,6 +109,7 @@ describe('runtime version manager storage migration', () => {
     writeFileSync(join(legacyWebUiDirectory, 'package.json'), JSON.stringify({ version: '0.6.30' }))
     writeFileSync(activeVersionPath, JSON.stringify({
       schema: 1,
+      desktopAppVersion: '0.6.30',
       runtimeRootDirectory: storageRoot,
       platform: 'test-platform',
     }))
@@ -101,9 +125,11 @@ describe('runtime version manager storage migration', () => {
       active: false,
     }])
     const activated = activateDownloadedWebUiVersion('0.6.31')
+    expect(activated.desktopAppVersion).toBe('0.6.30')
     expect(activated.webUiVersion).toBe('0.6.31')
     expect(activated.webUiDirectory).toBeUndefined()
     expect(() => activateDownloadedWebUiVersion('0.6.30'))
       .toThrow('Downloaded Web UI version not found')
   })
+
 })

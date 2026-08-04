@@ -4,11 +4,13 @@ import { NAlert, NButton, NIcon, NSpin, useMessage } from 'naive-ui'
 import { useI18n } from 'vue-i18n'
 import { useFilesStore } from '@/stores/hermes/files'
 import { fetchFilePreviewBlob } from '@/api/hermes/files'
+import { fetchAuthenticatedBlob, saveBlob } from '@/api/hermes/binary-content'
 import { downloadFile } from '@/api/hermes/download'
 import { downloadSessionWorkspaceFile, fetchSessionWorkspaceFileBlob } from '@/api/hermes/sessions'
 import { downloadGroupWorkspaceFile, fetchGroupWorkspaceFileBlob } from '@/api/hermes/group-chat'
 import { handleCodeBlockCopyClick, renderHighlightedCodeBlock } from '@/components/hermes/chat/highlight'
 import { previewMimeMatches } from '@/utils/hermes/file-preview'
+import { openHtmlInDesktopBrowser } from '@/utils/desktop-browser'
 
 const MarkdownRenderer = defineAsyncComponent(async () => (await import('@/components/hermes/chat/MarkdownRenderer.vue')).default)
 const HtmlFilePreview = defineAsyncComponent(async () => (await import('./HtmlFilePreview.vue')).default)
@@ -53,11 +55,13 @@ async function loadPreview(): Promise<void> {
   requestController = new AbortController()
   loading.value = true
   try {
-    const blob = file.workspaceRoomId
-      ? await fetchGroupWorkspaceFileBlob(file.workspaceRoomId, file.path, requestController.signal)
-      : file.workspaceSessionId
-        ? await fetchSessionWorkspaceFileBlob(file.workspaceSessionId, file.path, requestController.signal)
-        : await fetchFilePreviewBlob(file.path, file.profile, requestController.signal)
+    const blob = file.sourceUrl
+      ? await fetchAuthenticatedBlob(file.sourceUrl, { profile: null, signal: requestController.signal })
+      : file.workspaceRoomId
+        ? await fetchGroupWorkspaceFileBlob(file.workspaceRoomId, file.path, requestController.signal)
+        : file.workspaceSessionId
+          ? await fetchSessionWorkspaceFileBlob(file.workspaceSessionId, file.path, requestController.signal)
+          : await fetchFilePreviewBlob(file.path, file.profile, requestController.signal)
     if (generation !== requestGeneration) return
     if (!previewMimeMatches(file.type, blob.type)) {
       throw new Error(t('files.previewMimeMismatch'))
@@ -68,6 +72,7 @@ async function loadPreview(): Promise<void> {
       const text = await blob.text()
       if (generation !== requestGeneration) return
       previewText.value = text
+      if (file.type === 'html' && await openHtmlInDesktopBrowser(text, file.name)) return
     } else {
       const buffer = await blob.arrayBuffer()
       if (generation !== requestGeneration) return
@@ -91,7 +96,9 @@ async function handleDownload(): Promise<void> {
   if (!file || downloading.value) return
   downloading.value = true
   try {
-    if (file.workspaceRoomId) {
+    if (file.sourceUrl) {
+      saveBlob(await fetchAuthenticatedBlob(file.sourceUrl, { profile: null }), file.name)
+    } else if (file.workspaceRoomId) {
       await downloadGroupWorkspaceFile(file.workspaceRoomId, file.path, file.name)
     } else if (file.workspaceSessionId) {
       await downloadSessionWorkspaceFile(file.workspaceSessionId, file.path, file.name)
@@ -231,6 +238,9 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   height: 100%;
+  width: 100%;
+  min-height: 0;
+  background: inherit;
 }
 
 .preview-header {
@@ -269,7 +279,10 @@ onBeforeUnmount(() => {
   padding: 16px;
   display: flex;
   justify-content: center;
+  width: 100%;
+  height: 100%;
   min-height: 0;
+  box-sizing: border-box;
 }
 
 .preview-error { width: min(680px, 100%); align-self: flex-start; }

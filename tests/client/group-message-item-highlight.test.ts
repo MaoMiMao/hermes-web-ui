@@ -16,6 +16,7 @@ vi.mock('naive-ui', () => ({
     warning: vi.fn(),
     info: vi.fn(),
   }),
+  NPopover: { template: '<div><slot name="trigger" /><slot /></div>' },
 }))
 
 vi.mock('@/api/hermes/download', () => ({
@@ -120,6 +121,26 @@ describe('GroupMessageItem tool details', () => {
     expect(blocks[0].find('code').text()).toContain('values')
     expect(blocks[1].find('.code-lang').text()).toBe('json')
     expect(blocks[1].find('code').text()).toBe('false')
+  })
+
+  it('adds the tool-call reasoning as the first expanded detail section', async () => {
+    const wrapper = mountToolMessage({
+      reasoning: 'I should inspect the group context first.',
+      toolArgs: { room: 'room-1' },
+      toolResult: 'done',
+    })
+
+    await wrapper.find('.tool-line').trigger('click')
+
+    const sections = wrapper.findAll('.tool-details .tool-detail-section')
+    expect(sections).toHaveLength(3)
+    expect(sections.map(section => section.find('.tool-detail-label').text())).toEqual([
+      'chat.thinkingLabel',
+      'chat.arguments',
+      'chat.result',
+    ])
+    expect(wrapper.get('.tool-detail-reasoning markdown-renderer-stub').attributes('content'))
+      .toBe('I should inspect the group context first.')
   })
 
   it('keeps plain string false payloads as text', async () => {

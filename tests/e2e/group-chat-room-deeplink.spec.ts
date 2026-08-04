@@ -1,6 +1,8 @@
 import { expect, test, type Page, type Route } from '@playwright/test'
 import { authenticate, TEST_MODEL_GROUP } from './fixtures'
 
+type DesktopPlatform = 'darwin' | 'win32'
+
 const baseRooms = [
   { id: 'room-alpha', name: 'Alpha Room', inviteCode: 'ALPHA1', canManage: true, workspace: '/tmp/alpha', triggerTokens: 100000, maxHistoryTokens: 32000, tailMessageCount: 10, totalTokens: 123 },
   { id: 'room-beta', name: 'Beta Room', inviteCode: 'BETA22', canManage: true, workspace: '/tmp/beta', triggerTokens: 100000, maxHistoryTokens: 32000, tailMessageCount: 10, totalTokens: 456 },
@@ -11,6 +13,7 @@ const groupWorkspaceDiff = {
   kind: 'workspace_diff',
   version: 1,
   room_id: 'room-alpha',
+  parent_message_id: 'alpha-file',
   workspace: '/tmp/alpha',
   files_changed: 1,
   additions: 1,
@@ -36,6 +39,26 @@ const messagesByRoom: Record<string, unknown[]> = {
   ],
   'room-beta': [
     { id: 'beta-msg', roomId: 'room-beta', senderId: 'user-1', senderName: 'Bob', content: 'Beta room message', timestamp: 1_790_000_100, role: 'user' },
+  ],
+}
+
+const agentsByRoom: Record<string, unknown[]> = {
+  'room-alpha': [
+    {
+      id: 'agent-row-1',
+      roomId: 'room-alpha',
+      agentId: 'agent-1',
+      agent: 'hermes',
+      profile: 'default',
+      provider: 'test-provider',
+      model: 'test-model',
+      apiMode: '',
+      reasoningEffort: '',
+      name: 'Worker',
+      description: 'Group agent',
+      avatar: '',
+      invited: 1,
+    },
   ],
 }
 
@@ -105,7 +128,7 @@ async function mockGroupChatApi(page: Page) {
       const roomId = decodeURIComponent(detailMatch[1])
       const room = rooms.find(r => r.id === roomId)
       return room
-        ? json({ room, messages: messagesByRoom[roomId] || [], agents: [], members: [{ id: 'member-1', userId: 'user-1', name: 'User One', description: '', joinedAt: 1_790_000_000 }] })
+        ? json({ room, messages: messagesByRoom[roomId] || [], agents: agentsByRoom[roomId] || [], members: [{ id: 'member-1', userId: 'user-1', name: 'User One', description: '', joinedAt: 1_790_000_000 }] })
         : json({ error: 'Room not found' }, 404)
     }
 
@@ -123,6 +146,7 @@ async function mockGroupChatSocket(page: Page) {
       body: `
 const state = window.__PW_GROUP_SOCKET__ || (window.__PW_GROUP_SOCKET__ = { sockets: [], emitted: [] })
 const roomMessages = ${JSON.stringify(messagesByRoom)}
+const roomAgents = ${JSON.stringify(agentsByRoom)}
 function makeSocket(url, options) {
   const listeners = new Map()
   const socket = {
@@ -139,7 +163,7 @@ function makeSocket(url, options) {
       state.emitted.push({ event, payload })
       if (event === 'join' && typeof ack === 'function') {
         const roomId = payload && payload.roomId
-        setTimeout(() => ack({ roomId, roomName: roomId, members: [], messages: roomMessages[roomId] || [], agents: [], rooms: [], typingUsers: [], contextStatuses: [] }), 0)
+        setTimeout(() => ack({ roomId, roomName: roomId, members: [], messages: roomMessages[roomId] || [], agents: roomAgents[roomId] || [], rooms: [], typingUsers: [], contextStatuses: [] }), 0)
       }
       if (event === 'message' && typeof ack === 'function') {
         setTimeout(() => ack({ id: payload && payload.id }), 0)
@@ -171,7 +195,25 @@ export default { io }
   })
 }
 
-async function setup(page: Page, path: string) {
+async function installDesktopBridge(page: Page, platform: DesktopPlatform) {
+  await page.addInitScript((desktopPlatform) => {
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        isDesktop: true,
+        platform: desktopPlatform,
+        getWindowState: async () => ({ isMaximized: false }),
+        windowControl: async () => ({ isMaximized: false }),
+      },
+    })
+  }, platform)
+}
+
+async function setup(page: Page, path: string, platform?: DesktopPlatform) {
+  if (platform) await installDesktopBridge(page, platform)
+  await page.addInitScript(() => {
+    window.localStorage.setItem('hermes.groupChat.refactorNotice.v1.acknowledged', '1')
+  })
   await authenticate(page)
   await mockGroupChatSocket(page)
   const api = await mockGroupChatApi(page)
@@ -204,6 +246,56 @@ test.describe('group chat room deep links', () => {
     await expect(panel.locator('.preview-filename')).toHaveText('package.json')
   })
 
+  test('keeps the workspace drawer seam and resize direction aligned in LTR and RTL', async ({ page }) => {
+    await setup(page, '/#/hermes/group-chat/room/room-alpha')
+    await page.locator('.markdown-file-card', { hasText: 'package.json' }).click()
+
+    const wrapper = page.locator('.group-chat-content-wrapper')
+    const panel = page.locator('.group-workspace-panel')
+    const handle = page.locator('.group-workspace-resize-handle')
+    await expect(panel).toBeVisible()
+
+    const geometry = async () => {
+      const [wrapperBox, panelBox, handleBox] = await Promise.all([
+        wrapper.boundingBox(),
+        panel.boundingBox(),
+        handle.boundingBox(),
+      ])
+      if (!wrapperBox || !panelBox || !handleBox) throw new Error('group drawer geometry unavailable')
+      return {
+        wrapperLeft: wrapperBox.x,
+        wrapperRight: wrapperBox.x + wrapperBox.width,
+        panelLeft: panelBox.x,
+        panelRight: panelBox.x + panelBox.width,
+        panelWidth: panelBox.width,
+        handleCenter: handleBox.x + handleBox.width / 2,
+        handleY: handleBox.y + handleBox.height / 2,
+      }
+    }
+
+    const ltr = await geometry()
+    expect(Math.abs(ltr.panelRight - ltr.wrapperRight)).toBeLessThanOrEqual(1)
+    expect(Math.abs(ltr.handleCenter - ltr.panelLeft)).toBeLessThanOrEqual(1)
+    await page.mouse.move(ltr.handleCenter, ltr.handleY)
+    await page.mouse.down()
+    await page.mouse.move(ltr.handleCenter + 32, ltr.handleY)
+    await page.mouse.up()
+    await expect.poll(async () => (await geometry()).panelWidth).toBeLessThan(ltr.panelWidth)
+
+    await page.evaluate(() => document.documentElement.setAttribute('dir', 'rtl'))
+    await expect.poll(async () => {
+      const current = await geometry()
+      return Math.abs(current.panelLeft - current.wrapperLeft) <= 1
+    }).toBe(true)
+    const rtl = await geometry()
+    expect(Math.abs(rtl.handleCenter - rtl.panelRight)).toBeLessThanOrEqual(1)
+    await page.mouse.move(rtl.handleCenter, rtl.handleY)
+    await page.mouse.down()
+    await page.mouse.move(rtl.handleCenter - 32, rtl.handleY)
+    await page.mouse.up()
+    await expect.poll(async () => (await geometry()).panelWidth).toBeLessThan(rtl.panelWidth)
+  })
+
   test('workspace control sits beside the upper-right settings control and toggles the group workspace panel', async ({ page }) => {
     await setup(page, '/#/hermes/group-chat/room/room-alpha')
 
@@ -222,16 +314,51 @@ test.describe('group chat room deep links', () => {
     await expect(page.locator('.group-workspace-panel')).toHaveCount(0)
   })
 
+  for (const platform of ['darwin', 'win32'] as const) {
+    test(`opens Agent settings from the ${platform} avatar rail`, async ({ page }) => {
+      await setup(page, '/#/hermes/group-chat/room/room-alpha', platform)
+
+      const trigger = page.getByRole('button', { name: 'Worker' })
+      await expect(trigger).toBeVisible()
+      await expect(trigger).toHaveCSS('-webkit-app-region', 'no-drag')
+      await trigger.click()
+
+      const modal = page.locator('.modal').filter({ hasText: 'Edit Worker' })
+      await expect(modal).toBeVisible()
+      await expect(modal.getByText('Avatar', { exact: true })).toBeVisible()
+      await expect(modal.getByText('Agent Name', { exact: true })).toBeVisible()
+    })
+  }
+
+  test('member count collapses the default-open scrollable avatar rail', async ({ page }) => {
+    await setup(page, '/#/hermes/group-chat/room/room-alpha')
+
+    const rail = page.locator('.agent-avatar-rail')
+    const memberToggle = page.locator('.member-count-toggle')
+    await expect(rail).toBeVisible()
+    await expect(memberToggle).toHaveAttribute('aria-expanded', 'true')
+    await expect(rail.locator('.agent-avatar-rail-trigger')).toHaveCSS('overflow-y', 'auto')
+
+    await memberToggle.click()
+    await expect(rail).toHaveCount(0)
+    await expect(memberToggle).toHaveAttribute('aria-expanded', 'false')
+
+    await memberToggle.click()
+    await expect(rail).toBeVisible()
+    await page.getByRole('button', { name: 'Your Name' }).click()
+    await expect(page.locator('.n-modal').filter({ hasText: 'Your Name' })).toBeVisible()
+  })
+
   test('room settings rotate invite codes only after the update API succeeds', async ({ page }) => {
     const api = await setup(page, '/#/hermes/group-chat/room/room-alpha')
 
     const settingsButton = page.locator('.chat-header .header-info .compression-settings-button')
     await settingsButton.click()
 
-    const modal = page.locator('.room-settings-modal')
-    await expect(modal.getByRole('heading', { name: 'Room Settings' })).toBeVisible()
-    const inviteInput = modal.getByPlaceholder('Enter a new invite code')
-    const updateButton = modal.getByRole('button', { name: 'Update' })
+    const drawer = page.locator('.n-drawer').filter({ has: page.locator('.room-settings-drawer') })
+    await expect(drawer.getByText('Room Settings', { exact: true })).toBeVisible()
+    const inviteInput = drawer.getByPlaceholder('Enter a new invite code')
+    const updateButton = drawer.getByRole('button', { name: 'Update' }).nth(1)
 
     await expect(inviteInput).toHaveValue('ALPHA1')
     await expect(updateButton).toBeDisabled()
@@ -252,9 +379,10 @@ test.describe('group chat room deep links', () => {
     await updateButton.click()
     await expect((await failureResponse).status()).toBe(409)
 
-    await modal.getByRole('button', { name: 'Cancel' }).click()
+    await page.keyboard.press('Escape')
+    await expect(drawer).toBeHidden()
     await settingsButton.click()
-    await expect(modal.getByPlaceholder('Enter a new invite code')).toHaveValue('NEW456')
+    await expect(drawer.getByPlaceholder('Enter a new invite code')).toHaveValue('NEW456')
   })
 
   test('read-only room members cannot open room settings', async ({ page }) => {

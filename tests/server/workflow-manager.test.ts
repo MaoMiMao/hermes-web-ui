@@ -1,16 +1,44 @@
 import { afterAll, describe, expect, it, vi } from 'vitest'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-const workflowManagerTestDbDir = mkdtempSync(join(tmpdir(), 'hermes-workflow-manager-'))
+const originalWorkflowManagerTestDbDir = process.env.HERMES_WEB_UI_TEST_DB_DIR
+const originalWorkflowManagerWebUiHome = process.env.HERMES_WEB_UI_HOME
+const originalWorkflowManagerStateDir = process.env.HERMES_WEBUI_STATE_DIR
+const workflowManagerTestRoot = mkdtempSync(join(tmpdir(), 'hermes-workflow-manager-'))
+const workflowManagerTestDbDir = join(workflowManagerTestRoot, 'db')
+const workflowManagerTestHome = join(workflowManagerTestRoot, 'home')
 process.env.HERMES_WEB_UI_TEST_DB_DIR = workflowManagerTestDbDir
+process.env.HERMES_WEB_UI_HOME = workflowManagerTestHome
+process.env.HERMES_WEBUI_STATE_DIR = workflowManagerTestHome
+
+function restoreEnvironmentVariable(name: string, value: string | undefined): void {
+  if (value === undefined) delete process.env[name]
+  else process.env[name] = value
+}
 
 const chatRunMock = vi.hoisted(() => ({
   runAndWait: vi.fn(),
   abortSession: vi.fn(),
   sessionOutputs: new Map<string, string>(),
 }))
+
+const workflowSkillResolverMock = vi.hoisted(() => ({
+  resolve: null as null | ((args: { agent?: string; profile: string; skillName: string }) => Promise<any>),
+}))
+
+vi.mock('../../packages/server/src/services/workflow-skill-resolver', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../packages/server/src/services/workflow-skill-resolver')>()
+  return {
+    ...actual,
+    resolveWorkflowSkillContent: (args: { agent?: string; profile: string; skillName: string }) => (
+      workflowSkillResolverMock.resolve
+        ? workflowSkillResolverMock.resolve(args)
+        : actual.resolveWorkflowSkillContent(args)
+    ),
+  }
+})
 
 vi.mock('../../packages/server/src/routes/hermes/chat-run', () => ({
   getChatRunServer: () => chatRunMock,
@@ -31,14 +59,30 @@ vi.mock('../../packages/server/src/db/hermes/session-store', async (importOrigin
 afterAll(async () => {
   const { closeDb } = await import('../../packages/server/src/db/index')
   closeDb()
-  delete process.env.HERMES_WEB_UI_TEST_DB_DIR
-  rmSync(workflowManagerTestDbDir, { recursive: true, force: true })
+  restoreEnvironmentVariable('HERMES_WEB_UI_TEST_DB_DIR', originalWorkflowManagerTestDbDir)
+  restoreEnvironmentVariable('HERMES_WEB_UI_HOME', originalWorkflowManagerWebUiHome)
+  restoreEnvironmentVariable('HERMES_WEBUI_STATE_DIR', originalWorkflowManagerStateDir)
+  rmSync(workflowManagerTestRoot, { recursive: true, force: true })
 })
 
 describe('workflow manager', () => {
-  it('uses an isolated SQLite directory for this suite', async () => {
+  it('isolates both SQLite and default workflow workspaces for this suite', async () => {
+    const { config } = await import('../../packages/server/src/config')
     const { getStoragePath } = await import('../../packages/server/src/db/index')
+    const { initAllStores } = await import('../../packages/server/src/db/hermes/init')
+    const { createWorkflow, deleteWorkflow } = await import('../../packages/server/src/db/hermes/workflow-store')
+
     expect(getStoragePath()).toBe(join(workflowManagerTestDbDir, 'hermes-web-ui.db'))
+    expect(config.appHome).toBe(workflowManagerTestHome)
+
+    initAllStores()
+    const workflow = createWorkflow({ name: 'Isolated workspace', profile: 'default' })
+    try {
+      expect(workflow.workspace).toBe(join(workflowManagerTestHome, 'workflow', 'default', workflow.id))
+      expect(existsSync(workflow.workspace!)).toBe(true)
+    } finally {
+      deleteWorkflow(workflow.id)
+    }
   })
 
   it('returns a server-wide singleton instance', async () => {
@@ -217,6 +261,61 @@ describe('workflow manager', () => {
     } finally { await manager.delete(workflow.id) }
   })
 
+  it('preserves authored visual graph fields in an immutable run snapshot', async () => {
+    const { initAllStores } = await import('../../packages/server/src/db/hermes/init')
+    const { WorkflowManager } = await import('../../packages/server/src/services/workflow-manager')
+    initAllStores()
+    chatRunMock.sessionOutputs.clear()
+    chatRunMock.runAndWait.mockReset().mockImplementation(async (request: { session_id: string }) => {
+      const output = chatRunMock.runAndWait.mock.calls.length === 1 ? '{"decision":"READY"}' : 'delivered'
+      chatRunMock.sessionOutputs.set(request.session_id, output)
+      return { ok: true, output }
+    })
+    const manager = new WorkflowManager()
+    const workflow = manager.create({
+      name: `Visual run snapshot ${Date.now()}`, profile: 'default',
+      nodes: [
+        { id: 'plan', type: 'agent', position: { x: -320, y: -40 }, data: { title: 'Plan', agent: 'hermes', input: 'plan' } },
+        { id: 'delivery', type: 'agent', position: { x: 1_860, y: 265 }, data: { title: 'Delivery', agent: 'hermes', input: 'deliver' } },
+      ],
+      edges: [{
+        id: 'plan-delivery-ready', source: 'plan', target: 'delivery',
+        sourceHandle: 'top', targetHandle: 'bottom', label: 'READY path', animated: true,
+        sourceNode: { id: 'plan', runtimeOnly: true }, targetNode: { id: 'delivery', runtimeOnly: true },
+        sourceX: 123, targetX: 456, events: { click: 'runtime-only' },
+        data: { orchestration: {
+          route: 'success', condition: { path: 'outputJson.decision', operator: 'equals', value: 'READY' },
+        } },
+      } as any],
+    })
+    try {
+      const result = await manager.runNow(workflow.id)
+      expect(result.run.status).toBe('completed')
+      expect(result.run.snapshot_nodes.map((node: any) => ({ id: node.id, position: node.position }))).toEqual([
+        { id: 'plan', position: { x: -320, y: -40 } },
+        { id: 'delivery', position: { x: 1_860, y: 265 } },
+      ])
+      expect(result.run.snapshot_edges).toEqual([expect.objectContaining({
+        id: 'plan-delivery-ready', source: 'plan', target: 'delivery',
+        sourceHandle: 'top', targetHandle: 'bottom', label: 'READY path', animated: true,
+        data: { orchestration: {
+          route: 'success', condition: { path: 'outputJson.decision', operator: 'equals', value: 'READY' },
+        } },
+      })])
+      expect(result.run.snapshot_edges[0]).not.toHaveProperty('sourceNode')
+      expect(result.run.snapshot_edges[0]).not.toHaveProperty('targetNode')
+      expect(result.run.snapshot_edges[0]).not.toHaveProperty('sourceX')
+      expect(result.run.snapshot_edges[0]).not.toHaveProperty('targetX')
+      expect(result.run.snapshot_edges[0]).not.toHaveProperty('events')
+      expect(result.run.snapshot_edges[0]).not.toHaveProperty('orchestration')
+      expect(chatRunMock.runAndWait).toHaveBeenCalledTimes(2)
+
+      const rerun = await manager.rerunFromNode(workflow.id, result.run.id, 'delivery')
+      expect(rerun.run.status).toBe('completed')
+      expect(chatRunMock.runAndWait).toHaveBeenCalledTimes(3)
+    } finally { await manager.delete(workflow.id) }
+  })
+
   it('continues forwarding api mode for coding-agent workflow nodes', async () => {
     const { initAllStores } = await import('../../packages/server/src/db/hermes/init')
     const { WorkflowManager } = await import('../../packages/server/src/services/workflow-manager')
@@ -238,6 +337,39 @@ describe('workflow manager', () => {
         coding_agent_id: 'codex', apiMode: 'chat_completions',
       }), expect.any(Object))
       expect(chatRunMock.runAndWait.mock.calls[0]?.[0]).not.toHaveProperty('background_delegation_enabled')
+    } finally { await manager.delete(workflow.id) }
+  })
+
+  it('forwards workflow images to coding-agent nodes as ContentBlock input', async () => {
+    const { initAllStores } = await import('../../packages/server/src/db/hermes/init')
+    const { WorkflowManager } = await import('../../packages/server/src/services/workflow-manager')
+    initAllStores()
+    chatRunMock.runAndWait.mockReset().mockResolvedValue({ ok: true, output: 'done' })
+    const manager = new WorkflowManager()
+    const imagePath = '/tmp/workflow-reference.png'
+    const workflow = manager.create({
+      name: `Coding Agent image input ${Date.now()}`,
+      profile: 'default',
+      nodes: [{ id: 'agent', type: 'agent', data: {
+        title: 'Agent', agent: 'codex', provider: 'custom:test', model: 'model-a',
+        apiMode: 'codex_responses', input: 'inspect the reference', images: [imagePath],
+      } }],
+      edges: [],
+    })
+    try {
+      await manager.runNow(workflow.id)
+      expect(chatRunMock.runAndWait).toHaveBeenCalledWith(expect.objectContaining({
+        coding_agent_id: 'codex',
+        input: [
+          { type: 'text', text: '[Current task]\ninspect the reference' },
+          {
+            type: 'image',
+            name: 'workflow-reference.png',
+            path: imagePath,
+            media_type: 'image/png',
+          },
+        ],
+      }), expect.any(Object))
     } finally { await manager.delete(workflow.id) }
   })
 
@@ -588,11 +720,53 @@ describe('workflow manager', () => {
       const result = await manager.runNow(workflow.id, { timeoutMs: 100 })
       expect(result.run.status).toBe('failed')
       expect(result.run.error).toBe('workflow run timed out after 100ms')
+      expect(result.run).toMatchObject({
+        requested_timeout_ms: 100,
+        deadline_at: 1100,
+      })
       expect(receivedTimeouts).toEqual([100, 60, 20])
+      expect(result.nodeSessions.map(session => [session.execution_id, session.remaining_timeout_ms_at_start])).toEqual([
+        ['header@loop:retry:0', 100],
+        ['latch@loop:retry:0', 60],
+        ['header@loop:retry:1', 20],
+      ])
       expect(result.nodeSessions.map(session => session.execution_id)).toEqual([
         'header@loop:retry:0', 'latch@loop:retry:0', 'header@loop:retry:1',
       ])
     } finally { nowSpy.mockRestore(); await manager.delete(workflow.id) }
+  })
+
+  it('bounds skill assembly by the same absolute Run deadline', async () => {
+    const { initAllStores } = await import('../../packages/server/src/db/hermes/init')
+    const { WorkflowManager } = await import('../../packages/server/src/services/workflow-manager')
+    initAllStores()
+    const manager = new WorkflowManager()
+    chatRunMock.runAndWait.mockReset()
+    let resolutionCount = 0
+    workflowSkillResolverMock.resolve = async ({ skillName }) => {
+      resolutionCount += 1
+      if (resolutionCount === 1) return { name: skillName, content: 'preflight evidence' }
+      return new Promise(() => {})
+    }
+    const workflow = manager.create({
+      name: `Skill assembly deadline ${Date.now()}`,
+      profile: 'default',
+      nodes: [{ id: 'agent', type: 'agent', data: {
+        title: 'Agent', agent: 'hermes', input: 'work', skills: ['delayed-skill'],
+      } }],
+      edges: [],
+    })
+    try {
+      const result = await manager.runNow(workflow.id, { timeoutMs: 20 })
+      expect(result.run.status).toBe('failed')
+      expect(result.run.error).toBe('workflow run timed out after 20ms')
+      expect(result.nodeSessions).toEqual([])
+      expect(chatRunMock.runAndWait).not.toHaveBeenCalled()
+      expect(manager.getRuntimeStatus(workflow.id).nodeStatuses.agent).toBe('failed')
+    } finally {
+      workflowSkillResolverMock.resolve = null
+      await manager.delete(workflow.id)
+    }
   })
 
   it('fails closed when run-deadline loop epoch evidence cannot be persisted', async () => {
@@ -2644,6 +2818,14 @@ describe('workflow manager', () => {
     try {
       const result = await manager.rerunFromNode(workflow.id, run.id, 'first', { timeoutMs: 100 })
       expect(receivedTimeouts).toEqual([100, 30])
+      expect(result.run).toMatchObject({
+        requested_timeout_ms: 100,
+        deadline_at: 9100,
+      })
+      expect(result.nodeSessions.filter(session => session.started_at !== null && session.started_at >= 9000)
+        .map(session => [session.node_id, session.remaining_timeout_ms_at_start])).toEqual([
+        ['first', 100], ['second', 30],
+      ])
       expect({ status: result.run.status, error: result.run.error, startedAt: result.run.started_at }).toEqual({
         status: 'failed', error: 'workflow run timed out after 100ms', startedAt: 9000,
       })

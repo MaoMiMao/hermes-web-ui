@@ -29,6 +29,7 @@ interface RunChatCompressionConfig {
 interface CompressionModelContext {
   model?: string | null
   provider?: string | null
+  allowHermesFallback?: boolean
 }
 
 export class ContextWindowTooSmallError extends Error {
@@ -243,13 +244,14 @@ export async function buildCompressedHistory(
   modelContext: CompressionModelContext = {},
   contextTokenEstimator?: (messages: ChatMessage[], messageTokens: number) => Promise<number | null | undefined>,
   currentInputTokens = 0,
+  excludeLastUser = true,
 ): Promise<ChatMessage[]> {
   try {
     let snapshot = getCompressionSnapshot(sessionId)
     let cursorParts: CursorSnapshotParts | null = null
     let history: ChatMessage[]
     if (snapshot?.compressedThroughMessageId != null) {
-      const cursorRead = readCursorSnapshotParts(sessionId, snapshot, { excludeLastUser: true })
+      const cursorRead = readCursorSnapshotParts(sessionId, snapshot, { excludeLastUser })
       if (cursorRead.status === 'usable') {
         cursorParts = cursorRead.parts
         history = assembleCursorSnapshotHistory(snapshot, cursorParts, SUMMARY_PREFIX)
@@ -261,10 +263,10 @@ export async function buildCompressedHistory(
         )
         deleteCompressionSnapshot(sessionId)
         snapshot = null
-        history = await buildDbHistory(sessionId, { excludeLastUser: true })
+        history = await buildDbHistory(sessionId, { excludeLastUser })
       }
     } else {
-      history = await buildDbHistory(sessionId, { excludeLastUser: true })
+      history = await buildDbHistory(sessionId, { excludeLastUser })
     }
 
     const contextLength = getModelContextLength({
@@ -480,8 +482,10 @@ export async function compressHistory(
       profile: summarizerProfile,
       model: summarizerModelContext.model,
       provider: summarizerModelContext.provider,
+      sessionId,
       historyRevision: session?.history_revision ?? 0,
       workerKey: `${summarizerProfile}:compression:${sessionId}`,
+      allowHermesFallback: modelContext.allowHermesFallback !== false,
     })
     const afterTokens = await calcAndUpdateUsage(sessionId, cState, emit, {
       truncateToolResultsForContext: true,
@@ -615,8 +619,10 @@ export async function forceCompressBridgeHistory(
     profile: summarizerProfile,
     model: summarizerModelContext.model,
     provider: summarizerModelContext.provider,
+    sessionId,
     historyRevision: session?.history_revision ?? 0,
     workerKey: `${summarizerProfile}:compression:${sessionId}`,
+    allowHermesFallback: true,
   })
   const compressedMessages = result.messages.map(m => {
     const msg: any = { role: m.role, content: m.content }

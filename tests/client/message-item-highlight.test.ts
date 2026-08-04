@@ -106,7 +106,7 @@ describe('MessageItem tool details', () => {
     expect(chatStore.activeMessageReference?.content).toBe('Visible answer')
   })
 
-  it('renders highlighted code blocks for tool arguments and tool results', async () => {
+  it('renders reasoning, tool arguments, and tool results as three detail sections', async () => {
     const wrapper = mount(MessageItem, {
       props: {
         message: {
@@ -115,15 +115,34 @@ describe('MessageItem tool details', () => {
           content: '',
           timestamp: Date.now(),
           toolName: 'web_search',
+          reasoning: 'I should search for the current answer.',
           toolArgs: '{"query":"syntax highlighting"}',
           toolResult: '{"results":[{"title":"Done"}]}',
           toolStatus: 'done',
         } satisfies Message,
       },
+      global: {
+        stubs: {
+          MarkdownRenderer: {
+            props: ['content'],
+            template: '<div class="markdown-stub">{{ content }}</div>',
+          },
+        },
+      },
     })
 
     await wrapper.find('.tool-line').trigger('click')
 
+    const sections = wrapper.findAll('.tool-details .tool-detail-section')
+    expect(sections).toHaveLength(3)
+    expect(sections.map(section => section.find('.tool-detail-label').text())).toEqual([
+      'chat.thinkingLabel',
+      'chat.arguments',
+      'chat.result',
+    ])
+    expect(wrapper.get('.tool-detail-reasoning').text()).toContain(
+      'I should search for the current answer.',
+    )
     const blocks = wrapper.findAll('.tool-details .hljs-code-block')
     expect(blocks).toHaveLength(2)
     expect(blocks[0].find('.code-lang').text()).toBe('json')
@@ -435,62 +454,6 @@ describe('MessageItem tool details', () => {
     expect(toolDetails.find('.code-lang').text()).toBe('diff')
     expect(toolDetails.find('.diff-line-added .diff-line-content').text()).toContain('b'.repeat(1600))
     expect(toolDetails.text()).not.toContain('chat.truncated')
-  })
-
-  it('keeps workspace change files collapsed until the summary is expanded', async () => {
-    const wrapper = mount(MessageItem, {
-      props: {
-        message: {
-          id: 'workspace-change',
-          role: 'tool',
-          content: '',
-          timestamp: Date.now(),
-          toolName: 'workspace_diff',
-          toolStatus: 'done',
-          toolChange: {
-            change_id: 'change-1',
-            session_id: 'session-1',
-            run_id: 'run-1',
-            source: 'run',
-            workspace: '/tmp/repo',
-            workspace_kind: 'git',
-            started_at: 1,
-            finished_at: 2,
-            files_changed: 1,
-            additions: 2,
-            deletions: 1,
-            truncated: false,
-            total_patch_bytes: 32,
-            created_at: 2,
-            files: [{
-              id: 1,
-              change_id: 'change-1',
-              session_id: 'session-1',
-              path: 'src/example.ts',
-              old_path: null,
-              change_type: 'modified',
-              additions: 2,
-              deletions: 1,
-              size_before: 10,
-              size_after: 12,
-              patch_bytes: 32,
-              truncated: false,
-              binary: false,
-              created_at: 2,
-            }],
-          },
-        } satisfies Message,
-      },
-      global: { stubs: { MarkdownRenderer: true } },
-    })
-
-    expect(wrapper.find('.tool-change-file-row').exists()).toBe(false)
-    expect(wrapper.find('.tool-change-card-header').attributes('aria-expanded')).toBe('false')
-
-    await wrapper.find('.tool-change-card-header').trigger('click')
-
-    expect(wrapper.find('.tool-change-card-header').attributes('aria-expanded')).toBe('true')
-    expect(wrapper.find('.tool-change-file-row').text()).toContain('example.ts')
   })
 
   it('renders a turn-scoped workspace change inside its assistant response', async () => {

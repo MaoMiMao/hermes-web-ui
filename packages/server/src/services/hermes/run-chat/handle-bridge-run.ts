@@ -55,13 +55,16 @@ function stringValue(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
 }
 
-function parseBackgroundDelegation(toolName: string, output: string): { delegationId: string; status: string } | null {
+function parseBackgroundDelegation(
+  toolName: string,
+  output: string,
+): { delegationId: string; status: string; payload: Record<string, unknown> } | null {
   if (toolName !== 'delegate_task') return null
   try {
     const payload = JSON.parse(output) as Record<string, unknown>
     const delegationId = stringValue(payload.delegation_id)
     if (!delegationId || payload.mode !== 'background') return null
-    return { delegationId, status: stringValue(payload.status) || 'dispatched' }
+    return { delegationId, status: stringValue(payload.status) || 'dispatched', payload }
   } catch {
     return null
   }
@@ -412,7 +415,7 @@ export async function handleBridgeRun(
   // boundaries and remain disabled independently of this default.
   const backgroundDelegationEnabled = data.background_delegation_enabled !== false
   if (!session_id) {
-    socket.emit('run.failed', { event: 'run.failed', error: 'session_id is required for cli source' })
+    socket.emit('run.failed', { event: 'run.failed', queue_id: data.queue_id, error: 'session_id is required for cli source' })
     return
   }
 
@@ -660,6 +663,7 @@ export async function handleBridgeRun(
     pushState(sessionMap, session_id, 'run.started', {
       event: 'run.started',
       run_id: started.run_id,
+      queue_id: data.queue_id,
       queue_length: state.queue.length || 0,
       autonomous: data.autonomous === true,
       delegation_id: data.background_delegation_id,
@@ -667,6 +671,7 @@ export async function handleBridgeRun(
     emit('run.started', {
       event: 'run.started',
       run_id: started.run_id,
+      queue_id: data.queue_id,
       queue_length: state.queue.length || 0,
       autonomous: data.autonomous === true,
       delegation_id: data.background_delegation_id,
@@ -695,7 +700,7 @@ export async function handleBridgeRun(
         currentInputTokens,
         shouldPersistUserMessage && displayRole === 'user',
         data.model_groups,
-        { autonomous: data.autonomous === true, delegationId: data.background_delegation_id },
+        { autonomous: data.autonomous === true, delegationId: data.background_delegation_id, queueId: data.queue_id },
       )
       if (chunk.done) {
         sawTerminalChunk = true
@@ -741,7 +746,7 @@ export async function handleBridgeRun(
         currentInputTokens,
         shouldPersistUserMessage && displayRole === 'user',
         data.model_groups,
-        { autonomous: data.autonomous === true, delegationId: data.background_delegation_id },
+        { autonomous: data.autonomous === true, delegationId: data.background_delegation_id, queueId: data.queue_id },
       )
     }
   } catch (err: any) {
@@ -791,6 +796,7 @@ export async function handleBridgeRun(
       background_pending: backgroundPendingCount(state),
       autonomous: data.autonomous === true,
       delegation_id: data.background_delegation_id,
+      queue_id: data.queue_id,
     })
     if (queueLen > 0) {
       dequeueNextQueuedRun(socket, session_id)
@@ -1125,7 +1131,7 @@ async function applyBridgeChunkAsync(
   currentInputTokens = 0,
   currentInputIncludedInDb = true,
   modelGroups?: RunModelGroup[],
-  runMetadata?: { autonomous?: boolean; delegationId?: string },
+  runMetadata?: { autonomous?: boolean; delegationId?: string; queueId?: string },
 ): Promise<void> {
   if (state.activeRunMarker !== runMarker) {
     bridgeLogger.info({
@@ -1222,6 +1228,9 @@ async function applyBridgeChunkAsync(
             status: 'running',
             profile,
             updatedAt: Date.now(),
+            toolCallId: completed.id,
+            messageId: completed.messageId,
+            dispatchPayload: backgroundDelegation.payload,
           }
         }
       }
@@ -1279,6 +1288,9 @@ async function applyBridgeChunkAsync(
         files_written: ev.files_written,
         output_tail: ev.output_tail,
         background_seq: ev.background_seq,
+        timestamp: ev.timestamp,
+        started_at: ev.started_at,
+        updated_at: ev.updated_at,
       }
       pushState(sessionMap, sessionId, evType, payload)
       emit(evType, payload)
@@ -1653,6 +1665,7 @@ async function applyBridgeChunkAsync(
     background_pending: backgroundPendingCount(state),
     autonomous: runMetadata?.autonomous === true,
     delegation_id: runMetadata?.delegationId,
+    queue_id: runMetadata?.queueId,
     workspace_run_change: workspaceRunChange,
   }
   emit(eventName, payload)
